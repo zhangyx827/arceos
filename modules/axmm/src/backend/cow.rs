@@ -153,7 +153,7 @@ impl BackendOps for CowBackend {
     ) -> AxResult {
         // Determine mapping flags from the first present 4K page.
         let mut flags_opt: Option<MappingFlags> = None;
-
+        let mut old_pages = Vec::new();
         // Copy content from existing mappings into the new 2M page.
         for page_va in PageIter4K::new(m_start, m_end).expect("4KB aligned range") {
             let offset = page_va - m_start;
@@ -171,6 +171,7 @@ impl BackendOps for CowBackend {
                         PAGE_SIZE_4K,
                     );
                 }
+                old_pages.push(old_pa);
             }
             // holes remain zero
         }
@@ -181,18 +182,23 @@ impl BackendOps for CowBackend {
         };
 
         // Unmap original 4K pages and free frames when refcount drops to 0.
-        for page_va in PageIter4K::new(m_start, m_end).expect("4KB aligned range") {
-            if let Ok((frame, _flags, page_size)) = pt.unmap(page_va) {
+        // for page_va in PageIter4K::new(m_start, m_end).expect("4KB aligned range") {
+        //     if let Ok((frame, _flags, page_size)) = pt.unmap(page_va) {
                 // Page size may differ from `self.size` if huge pages are present.
-                if dec_frame_ref(frame) == 1 {
-                    dealloc_frame(frame, page_size);
-                }
-            }
-        }
-
-        pt.unmap_region(m_start, PAGE_SIZE_2M)?;
+                // if dec_frame_ref(frame) == 1 {
+                //     dealloc_frame(frame, page_size);
+                // }
+        //     }
+        // }
+        
+        pt.map2m_and_free(m_start, new_pa, flags)?;
         pt.map(m_start, new_pa, PageSize::Size2M, flags)?;
         inc_frame_ref(new_pa);
+        for frame in old_pages {
+            if dec_frame_ref(frame) == 1 {
+                dealloc_frame(frame, PageSize::Size4K);
+            }
+        }
         Ok(())
     }
 
