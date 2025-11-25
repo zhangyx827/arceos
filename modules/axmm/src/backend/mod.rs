@@ -11,6 +11,7 @@ use axsync::Mutex;
 use enum_dispatch::enum_dispatch;
 use memory_addr::{PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange};
 use memory_set::MappingBackend;
+use bitflags::bitflags;
 
 pub mod cow;
 pub mod file;
@@ -18,6 +19,7 @@ pub mod linear;
 pub mod shared;
 
 pub use shared::SharedPages;
+pub use cow::{current_ano_policy, modify_ano_policy};
 
 use crate::{AddrSpace, page_iter::PageIterWrapper};
 
@@ -81,7 +83,17 @@ pub trait BackendOps {
     ) -> AxResult<(usize, Option<Box<dyn FnOnce(&mut AddrSpace)>>)> {
         Ok((0, None))
     }
-
+    
+    /// Populate a memory region using PMD-sized page. Returns number of pages populated.
+    fn pte_fault_collapse(
+        &self,
+        _vaddr: VirtAddr,
+        _flags: MappingFlags,
+        _access_flags: MappingFlags,
+        _pt: &mut PageTableMut,
+    ) -> AxResult<(usize, Option<Box<dyn FnOnce(&mut AddrSpace)>>)> {
+        Ok((0, None))
+    }
     /// Duplicates this mapping for use in a different page table.
     ///
     /// This differs from `clone`, which is designed for splitting a mapping
@@ -96,6 +108,15 @@ pub trait BackendOps {
         new_pt: &mut PageTableMut,
         new_aspace: &Arc<Mutex<AddrSpace>>,
     ) -> AxResult<Backend>;
+
+    /// Modify the thp policy
+    fn clear_vma_flag(&self, vma_flags: VmaFlags);
+    
+    fn set_vma_flag(&self, vma_flags: VmaFlags);
+    
+    fn transparent_hugepage_enabled(&self) -> bool;
+
+    fn collapse_page(&self, m_start: VirtAddr, m_end: VirtAddr, pt: &mut PageTableMut, new_pa: PhysAddr) -> AxResult;
 }
 
 /// A unified enum type for different memory mapping backends.
@@ -141,5 +162,17 @@ impl MappingBackend for Backend {
         pt: &mut Self::PageTable,
     ) -> bool {
         pt.modify().protect_region(start, size, new_flags).is_ok()
+    }
+}
+
+
+bitflags! {
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct VmaFlags: usize {
+        /// madvise(MADV_HUGEPAGE): 允许THP collapse
+        const HUGEPAGE    = 1 << 21;  // 匹配Linux VM_HUGEPAGE
+        /// madvise(MADV_NOHUGEPAGE): 禁用THP
+        const NOHUGEPAGE  = 1 << 22;  // 匹配Linux VM_NOHUGEPAGE
+        // 可扩展：MADV_WILLNEED=1<<10, MADV_DONTNEED=1<<11 等
     }
 }

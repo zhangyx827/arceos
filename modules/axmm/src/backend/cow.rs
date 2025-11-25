@@ -1,4 +1,5 @@
-use alloc::{boxed::Box, collections::btree_map::BTreeMap, sync::Arc};
+use alloc::{boxed::Box, collections::btree_map::BTreeMap, string::{String, ToString}, sync::Arc, vec::Vec};
+use axfs_ng_vfs::{VfsError, VfsResult};
 use core::slice;
 
 use axerrno::{AxError, AxResult};
@@ -9,14 +10,40 @@ use axhal::{
 };
 use axsync::Mutex;
 use kspin::SpinNoIrq;
-use memory_addr::{PhysAddr, VirtAddr, VirtAddrRange};
-
+use memory_addr::{PAGE_SIZE_4K, PageIter4K, PhysAddr, VirtAddr, VirtAddrRange};
+use lazy_static::lazy_static;
 use crate::{
     AddrSpace,
-    backend::{Backend, BackendOps, alloc_frame, dealloc_frame, pages_in},
+    backend::{Backend, BackendOps, VmaFlags, alloc_frame, dealloc_frame, pages_in}, page_iter::PAGE_SIZE_2M,
 };
 
+
 static FRAME_TABLE: SpinNoIrq<BTreeMap<PhysAddr, u8>> = SpinNoIrq::new(BTreeMap::new());
+
+// The global thp policy controled through 
+// /sys/kernel/mm/tranparent_hugepage/enabled
+lazy_static! {
+    static ref GLOBAL_THP_POLICY: SpinNoIrq<String> = SpinNoIrq::new(String::from("madvise\n"));
+}
+
+pub fn modify_ano_policy(policy: &str) -> VfsResult<Vec<u8>> {
+    if !policy.eq("never")
+    && !policy.eq("madvise")
+    && !policy.eq("always") 
+    && !policy.eq("") {
+        return Err(VfsError::InvalidInput);
+    }
+    // the "" is for the truncating
+    *GLOBAL_THP_POLICY.lock() = policy.to_string() + "\n";
+    Ok(Vec::new())
+}
+
+pub fn current_ano_policy() -> String {
+    // debug!("policy is {}", (*GLOBAL_THP_POLICY.lock().clone()).to_string());
+    let _s = (*GLOBAL_THP_POLICY.lock()).clone().to_string();
+    (*GLOBAL_THP_POLICY.lock().clone()).to_string()
+}
+
 
 fn inc_frame_ref(paddr: PhysAddr) {
     let mut table = FRAME_TABLE.lock();
@@ -38,6 +65,8 @@ fn dec_frame_ref(paddr: PhysAddr) -> usize {
     }
 }
 
+pub struct VmaFlagsWrapper(Mutex<VmaFlags>);
+
 /// Copy-on-write mapping backend.
 ///
 /// This corresponds to the `MAP_PRIVATE` flag.
@@ -46,6 +75,7 @@ pub struct CowBackend {
     start: VirtAddr,
     size: PageSize,
     file: Option<(FileBackend, u64, Option<u64>)>,
+    vma_flags: Arc<VmaFlagsWrapper>
 }
 
 impl CowBackend {
@@ -106,16 +136,79 @@ impl CowBackend {
                         self.size as _,
                     );
                 }
-
                 pt.remap(vaddr, new_frame, flags)?;
             }
         }
-
         Ok(())
     }
 }
 
 impl BackendOps for CowBackend {
+    fn collapse_page(
+        &self,
+        m_start: VirtAddr,
+        m_end: VirtAddr,
+        pt: &mut PageTableMut,
+        new_pa: PhysAddr,
+    ) -> AxResult {
+        // Determine mapping flags from the first present 4K page.
+        let mut flags_opt: Option<MappingFlags> = None;
+
+        // Copy content from existing mappings into the new 2M page.
+        for page_va in PageIter4K::new(m_start, m_end).expect("4KB aligned range") {
+            let offset = page_va - m_start;
+            if let Ok((old_pa, page_flags, _)) = pt.query(page_va) {
+                if flags_opt.is_none() {
+                    flags_opt = Some(page_flags);
+                }
+                let src = phys_to_virt(old_pa);
+                let dst_pa = new_pa + offset;
+                let dst = phys_to_virt(dst_pa);
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        src.as_ptr(),
+                        dst.as_mut_ptr(),
+                        PAGE_SIZE_4K,
+                    );
+                }
+            }
+            // holes remain zero
+        }
+
+        let Some(flags) = flags_opt else {
+            // No mapped 4K pages; nothing to collapse.
+            return Ok(());
+        };
+
+        // Unmap original 4K pages and free frames when refcount drops to 0.
+        for page_va in PageIter4K::new(m_start, m_end).expect("4KB aligned range") {
+            if let Ok((frame, _flags, page_size)) = pt.unmap(page_va) {
+                // Page size may differ from `self.size` if huge pages are present.
+                if dec_frame_ref(frame) == 1 {
+                    dealloc_frame(frame, page_size);
+                }
+            }
+        }
+
+        pt.unmap_region(m_start, PAGE_SIZE_2M)?;
+        pt.map(m_start, new_pa, PageSize::Size2M, flags)?;
+        inc_frame_ref(new_pa);
+        Ok(())
+    }
+
+    fn set_vma_flag(&self, vma_flags: VmaFlags) {
+        *self.vma_flags.0.lock() |= vma_flags;
+    }
+
+    fn clear_vma_flag(&self, vma_flags: VmaFlags) {
+        *self.vma_flags.0.lock() ^= vma_flags;
+    }
+
+    fn transparent_hugepage_enabled(&self) -> bool {
+        return *self.vma_flags.0.lock() == VmaFlags::HUGEPAGE
+        || current_ano_policy().eq("always\n")
+    }
+
     fn page_size(&self) -> PageSize {
         self.size
     }
@@ -129,15 +222,36 @@ impl BackendOps for CowBackend {
         debug!("Cow::unmap: {range:?}");
         for addr in pages_in(range, self.size)? {
             if let Ok((frame, _flags, page_size)) = pt.unmap(addr) {
-                assert_eq!(page_size, self.size);
+                // With khugepaged
+                // Page size may not equal to `self.size`
                 if dec_frame_ref(frame) == 1 {
-                    dealloc_frame(frame, self.size);
+                    dealloc_frame(frame, page_size);
                 }
             } else {
                 // Deallocation is needn't if the page is not allocated.
             }
         }
         Ok(())
+    }
+
+    fn pte_fault_collapse(
+        &self,
+        vaddr: VirtAddr,
+        flags: MappingFlags,
+        _access_flags: MappingFlags,
+        pt: &mut PageTableMut,
+    ) -> AxResult<(usize, Option<Box<dyn FnOnce(&mut AddrSpace)>>)> {
+        let m_range = VirtAddrRange::from_start_size(vaddr, PageSize::Size2M as _);
+        for addr in pages_in(m_range, PageSize::Size4K)? {
+            if pt.query(addr).is_ok() {
+                return Err(PagingError::NotMapped.into());
+            }
+        }
+
+        let frame = alloc_frame(true, PageSize::Size2M)?;
+
+        pt.map(vaddr, frame, PageSize::Size2M, flags)?;
+        return Ok((1, None))
     }
 
     fn populate(
@@ -153,7 +267,7 @@ impl BackendOps for CowBackend {
                 Ok((paddr, page_flags, page_size)) => {
                     assert_eq!(self.size, page_size);
                     if access_flags.contains(MappingFlags::WRITE)
-                        && !page_flags.contains(MappingFlags::WRITE)
+                    && !page_flags.contains(MappingFlags::WRITE)
                     {
                         self.handle_cow_fault(addr, paddr, flags, pt)?;
                         pages += 1;
@@ -161,7 +275,7 @@ impl BackendOps for CowBackend {
                 }
                 // If the page is not mapped, try map it.
                 Err(PagingError::NotMapped) => {
-                    self.alloc_new_at(addr, flags, pt)?;
+                    let _ = self.alloc_new_at(addr, flags, pt);
                     pages += 1;
                 }
                 Err(_) => return Err(AxError::BadAddress),
@@ -199,7 +313,6 @@ impl BackendOps for CowBackend {
                 Err(_) => return Err(AxError::BadAddress),
             };
         }
-
         Ok(Backend::Cow(self.clone()))
     }
 }
@@ -216,6 +329,7 @@ impl Backend {
             start,
             size,
             file: Some((file, file_start, file_end)),
+            vma_flags: Arc::new(VmaFlagsWrapper(VmaFlags::empty().into())),
         })
     }
 
@@ -224,6 +338,7 @@ impl Backend {
             start,
             size,
             file: None,
+            vma_flags: Arc::new(VmaFlagsWrapper(VmaFlags::empty().into()))
         })
     }
 }

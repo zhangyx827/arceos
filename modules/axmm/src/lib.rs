@@ -20,7 +20,7 @@ use kspin::SpinNoIrq;
 use lazyinit::LazyInit;
 use memory_addr::{MemoryAddr, PhysAddr, va};
 
-pub use self::aspace::AddrSpace;
+pub use self::aspace::{AddrSpace, ScanResult};
 
 static KERNEL_ASPACE: LazyInit<SpinNoIrq<AddrSpace>> = LazyInit::new();
 
