@@ -192,7 +192,6 @@ impl BackendOps for CowBackend {
         // }
         
         pt.map2m_and_free(m_start, new_pa, flags)?;
-        pt.map(m_start, new_pa, PageSize::Size2M, flags)?;
         inc_frame_ref(new_pa);
         for frame in old_pages {
             if dec_frame_ref(frame) == 1 {
