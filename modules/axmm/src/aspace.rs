@@ -1,4 +1,5 @@
 use alloc::sync::Arc;
+use page_table_multiarch::PageSize;
 use core::{fmt, ops::DerefMut};
 
 use axerrno::{AxError, AxResult, ax_bail};
@@ -9,17 +10,27 @@ use axhal::{
 };
 use axsync::Mutex;
 use memory_addr::{
-    MemoryAddr, PAGE_SIZE_4K, PageIter4K, PhysAddr, VirtAddr, VirtAddrRange, is_aligned_4k,
+    MemoryAddr, PAGE_SIZE_4K, PAGE_SIZE_2M, PageIter4K, PhysAddr, VirtAddr, VirtAddrRange, is_aligned_4k,
 };
 use memory_set::{MemoryArea, MemorySet};
 
-use crate::backend::{Backend, BackendOps};
+use crate::{backend::Backend, backend::BackendOps};
+
+// use axhal::paging::PageSize;
+
 
 /// The virtual memory address space.
 pub struct AddrSpace {
     va_range: VirtAddrRange,
     areas: MemorySet<Backend>,
     pt: PageTable,
+    pub scan_cursor: Option<VirtAddr>,
+}
+
+pub enum ScanResult {
+    ScanContinue,
+    ScanFinished,
+    ScanMmExit,
 }
 
 impl AddrSpace {
@@ -64,6 +75,7 @@ impl AddrSpace {
             va_range: VirtAddrRange::from_start_size(base, size),
             areas: MemorySet::new(),
             pt: PageTable::try_new().map_err(|_| AxError::NoMemory)?,
+            scan_cursor: None,
         })
     }
 
@@ -352,7 +364,7 @@ impl AddrSpace {
         }
         false
     }
-
+    
     /// Attempts to clone the current address space into a new one.
     ///
     /// This method creates a new empty address space with the same base and
@@ -381,6 +393,80 @@ impl AddrSpace {
         drop(guard);
 
         Ok(new_aspace)
+    }
+
+    /// Finds the next area starting from the scan cursor.
+    pub fn next_area(&self) -> Option<&MemoryArea<Backend>> {
+        let cursor = self.scan_cursor.unwrap_or(self.base());
+        self.areas.iter()
+            .skip_while(|area| area.start() < cursor)
+            .next()
+    }
+
+    /// Advances the scan cursor to `area_end` for resumption.
+    pub fn advance_scan_cursor(&mut self, area_end: VirtAddr) {
+        self.scan_cursor = Some(area_end);
+    }
+
+    /// Resets scan to start from the beginning.
+    pub fn reset_scan_cursor(&mut self) {
+        self.scan_cursor = None;
+    }
+
+    pub fn try_collapse_page(
+        &mut self,
+        pages_scan: &mut usize,
+        max_pte_none: usize, 
+        pages_to_scan: usize,
+        pages_collapsed: &mut usize,
+    ) -> ScanResult {
+        let (backend, mut vaddr, area_end) = match self.next_area() {
+            None => return ScanResult::ScanFinished,
+            Some(area) => {
+                if !area.backend().transparent_hugepage_enabled() {
+                    self.advance_scan_cursor(area.end());
+                    return ScanResult::ScanContinue;
+                }
+                (
+                    area.backend().clone(),
+                    area.start().align_up(PAGE_SIZE_2M),
+                    area.end(),
+                )
+            }
+        };
+
+        while *pages_scan < pages_to_scan && vaddr + PAGE_SIZE_2M <= area_end {
+            let m_start = vaddr;
+            let m_end = vaddr + PAGE_SIZE_2M;
+            if let Ok((_, _, page_size)) = self.pt.query(vaddr) {
+                if page_size == PageSize::Size2M {
+                    vaddr += PAGE_SIZE_2M;
+                    *pages_scan += PAGE_SIZE_2M / PAGE_SIZE_4K;
+                    continue;
+                }
+            }          
+
+            let mut pte_none = 0;
+            for page_va in PageIter4K::new(m_start, m_end).expect("4KB aligned range") {
+                if self.pt.query(page_va).is_err() {
+                    pte_none += 1;
+
+                    if pte_none > max_pte_none {
+                        break;
+                    }
+                }
+            }
+
+            if pte_none < max_pte_none {
+                let _ = backend.collapse_page(m_start, m_end, &mut self.pt.modify());
+                *pages_collapsed += PAGE_SIZE_2M / PAGE_SIZE_4K;
+            }
+            vaddr += PAGE_SIZE_2M;
+            *pages_scan += PAGE_SIZE_2M / PAGE_SIZE_4K;
+        }
+
+        self.advance_scan_cursor(area_end);
+        ScanResult::ScanContinue
     }
 }
 

@@ -13,7 +13,7 @@ use memory_addr::{PAGE_SIZE_4K, VirtAddr, VirtAddrRange};
 
 use crate::{
     AddrSpace,
-    backend::{Backend, BackendOps, pages_in},
+    backend::{Backend, BackendOps, VmaFlags, current_ano_policy, pages_in},
 };
 
 #[doc(hidden)]
@@ -24,6 +24,7 @@ pub struct FileBackendInner {
     offset_page: u32,
     handle: AtomicUsize,
     futex_handle: Arc<()>,
+    vma_flags: Mutex<VmaFlags>,
 }
 impl Drop for FileBackendInner {
     fn drop(&mut self) {
@@ -34,6 +35,7 @@ impl Drop for FileBackendInner {
             }
         }
     }
+
 }
 impl FileBackendInner {
     pub fn register_listener(self: &Arc<Self>, aspace: &Arc<Mutex<AddrSpace>>) -> usize {
@@ -79,6 +81,19 @@ impl FileBackendInner {
             }
         }
     }
+
+    pub fn clear_vma_flag(&self, flag: VmaFlags) {
+        *self.vma_flags.lock() |= flag;
+    }
+
+    pub fn set_vma_flag(&self, flag: VmaFlags) {
+        *self.vma_flags.lock() ^= flag;
+    }
+
+    pub fn transparent_hugepage_enabled(&self) -> bool {
+        return *self.vma_flags.lock() == VmaFlags::HUGEPAGE
+        || current_ano_policy().eq("always\n");
+    }
 }
 
 /// File-backed mapping backend.
@@ -106,6 +121,31 @@ impl FileBackend {
 }
 
 impl BackendOps for FileBackend {
+    fn collapse_page(
+        &self,
+        _m_start: VirtAddr,
+        _m_end: VirtAddr,
+        _pt: &mut PageTableMut,
+    ) -> AxResult {
+        // File-backed mappings do not currently support THP collapse.
+        Ok(())
+    }
+    fn transparent_hugepage_enabled(&self) -> bool {
+        let inner = &self.0;
+        return inner.transparent_hugepage_enabled();
+    }
+
+    fn set_vma_flag(&self, vma_flags: VmaFlags) {
+        let inner = &self.0;
+        inner.set_vma_flag(vma_flags);
+    }
+    
+    fn clear_vma_flag(&self, vma_flags: VmaFlags) {
+        let inner = &self.0;
+        inner.clear_vma_flag(vma_flags);
+    }
+
+
     fn page_size(&self) -> PageSize {
         PageSize::Size4K
     }
@@ -218,10 +258,12 @@ impl BackendOps for FileBackend {
             offset_page: self.0.offset_page,
             handle: AtomicUsize::new(0),
             futex_handle: self.0.futex_handle.clone(),
+            vma_flags: VmaFlags::empty().into(),
         });
         inner.register_listener(new_aspace);
         Ok(Backend::File(FileBackend(inner)))
     }
+
 }
 
 impl Backend {
@@ -240,6 +282,7 @@ impl Backend {
             offset_page,
             handle: AtomicUsize::new(0),
             futex_handle: Arc::new(()),
+            vma_flags: VmaFlags::empty().into(),
         });
         inner.register_listener(aspace);
         Self::File(FileBackend(inner))

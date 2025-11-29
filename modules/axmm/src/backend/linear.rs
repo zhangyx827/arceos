@@ -7,7 +7,7 @@ use memory_addr::{PhysAddr, PhysAddrRange, VirtAddr, VirtAddrRange};
 
 use crate::{
     AddrSpace,
-    backend::{Backend, BackendOps},
+    backend::{Backend, BackendOps, VmaFlags},
 };
 
 /// Linear mapping backend.
@@ -27,6 +27,27 @@ impl LinearBackend {
 }
 
 impl BackendOps for LinearBackend {
+    fn collapse_page(
+        &self,
+        _m_start: VirtAddr,
+        _m_end: VirtAddr,
+        _pt: &mut PageTableMut,
+    ) -> AxResult {
+        // Linear backend does not support THP collapse; no-op.
+        Ok(())
+    }
+    
+    fn set_vma_flag(&self, _vma_flags:VmaFlags) {
+        unimplemented!()
+    }
+    fn transparent_hugepage_enabled(&self) -> bool {
+        false
+    }
+    
+    fn clear_vma_flag(&self, _vma_flags: VmaFlags) {
+        unimplemented!()
+    }
+
     fn page_size(&self) -> PageSize {
         PageSize::Size4K
     }

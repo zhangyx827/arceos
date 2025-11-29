@@ -1,4 +1,5 @@
-use alloc::{boxed::Box, collections::btree_map::BTreeMap, sync::Arc};
+use alloc::{boxed::Box, collections::btree_map::BTreeMap, string::{String, ToString}, sync::Arc, vec::Vec};
+use axfs_ng_vfs::{VfsError, VfsResult};
 use core::slice;
 
 use axerrno::{AxError, AxResult};
@@ -9,14 +10,38 @@ use axhal::{
 };
 use axsync::Mutex;
 use kspin::SpinNoIrq;
-use memory_addr::{PhysAddr, VirtAddr, VirtAddrRange};
-
+use memory_addr::{PAGE_SIZE_4K, PAGE_SIZE_2M, PageIter4K, PhysAddr, VirtAddr, VirtAddrRange};
+use lazy_static::lazy_static;
 use crate::{
     AddrSpace,
-    backend::{Backend, BackendOps, alloc_frame, dealloc_frame, pages_in},
+    backend::{Backend, BackendOps, VmaFlags, alloc_frame, dealloc_frame, pages_in},
 };
 
+
 static FRAME_TABLE: SpinNoIrq<BTreeMap<PhysAddr, u8>> = SpinNoIrq::new(BTreeMap::new());
+
+// The global thp policy controled through 
+// /sys/kernel/mm/tranparent_hugepage/enabled
+lazy_static! {
+    static ref GLOBAL_THP_POLICY: SpinNoIrq<String> = SpinNoIrq::new(String::from("madvise\n"));
+}
+
+pub fn modify_ano_policy(policy: &str) -> VfsResult<Vec<u8>> {
+    if !policy.eq("never")
+    && !policy.eq("madvise")
+    && !policy.eq("always") 
+    && !policy.eq("") {
+        return Err(VfsError::InvalidInput);
+    }
+    *GLOBAL_THP_POLICY.lock() = policy.to_string() + "\n";
+    Ok(Vec::new())
+}
+
+pub fn current_ano_policy() -> String {
+    let _s = (*GLOBAL_THP_POLICY.lock()).clone().to_string();
+    (*GLOBAL_THP_POLICY.lock().clone()).to_string()
+}
+
 
 fn inc_frame_ref(paddr: PhysAddr) {
     let mut table = FRAME_TABLE.lock();
@@ -38,6 +63,8 @@ fn dec_frame_ref(paddr: PhysAddr) -> usize {
     }
 }
 
+pub struct VmaFlagsWrapper(Mutex<VmaFlags>);
+
 /// Copy-on-write mapping backend.
 ///
 /// This corresponds to the `MAP_PRIVATE` flag.
@@ -46,6 +73,7 @@ pub struct CowBackend {
     start: VirtAddr,
     size: PageSize,
     file: Option<(FileBackend, u64, Option<u64>)>,
+    vma_flags: Arc<VmaFlagsWrapper>
 }
 
 impl CowBackend {
@@ -106,16 +134,81 @@ impl CowBackend {
                         self.size as _,
                     );
                 }
-
                 pt.remap(vaddr, new_frame, flags)?;
             }
         }
-
         Ok(())
     }
 }
 
 impl BackendOps for CowBackend {
+    fn collapse_page(
+        &self,
+        m_start: VirtAddr,
+        m_end: VirtAddr,
+        pt: &mut PageTableMut,
+    ) -> AxResult {
+        let new_pa = alloc_frame(true, PageSize::Size2M)?;
+
+        let mut flags_opt: Option<MappingFlags> = None;
+        let mut old_pages = Vec::new();
+        // Copy content from existing mappings into the new 2M page.
+        for page_va in PageIter4K::new(m_start, m_end).expect("4KB aligned range") {
+            let offset = page_va - m_start;
+            if let Ok((old_pa, page_flags, _)) = pt.query(page_va) {
+                if flags_opt.is_none() {
+                    flags_opt = Some(page_flags);
+                }
+                let src = phys_to_virt(old_pa);
+                let dst_pa = new_pa + offset;
+                let dst = phys_to_virt(dst_pa);
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        src.as_ptr(),
+                        dst.as_mut_ptr(),
+                        PAGE_SIZE_4K,
+                    );
+                }
+                old_pages.push(old_pa);
+            }
+            // holes remain zero
+        }
+
+        let Some(flags) = flags_opt else {
+            // No mapped 4K pages; free the newly allocated huge page.
+            dealloc_frame(new_pa, PageSize::Size2M);
+            return Ok(());
+        };
+
+        if pt.remap_huge(m_start, new_pa, flags, PageSize::Size2M).is_err() {
+            dealloc_frame(new_pa, PageSize::Size2M);
+        }
+
+        for offset in (0..PAGE_SIZE_2M).step_by(PAGE_SIZE_4K) {
+            inc_frame_ref(new_pa + offset);
+        }
+
+        for frame in old_pages {
+            if dec_frame_ref(frame) == 1 {
+                dealloc_frame(frame, PageSize::Size4K);
+            }
+        }
+        Ok(())
+    }
+
+    fn set_vma_flag(&self, vma_flags: VmaFlags) {
+        *self.vma_flags.0.lock() |= vma_flags;
+    }
+
+    fn clear_vma_flag(&self, vma_flags: VmaFlags) {
+        *self.vma_flags.0.lock() ^= vma_flags;
+    }
+
+    fn transparent_hugepage_enabled(&self) -> bool {
+        return *self.vma_flags.0.lock() == VmaFlags::HUGEPAGE
+        || current_ano_policy().eq("always\n")
+    }
+
     fn page_size(&self) -> PageSize {
         self.size
     }
@@ -127,11 +220,55 @@ impl BackendOps for CowBackend {
 
     fn unmap(&self, range: VirtAddrRange, pt: &mut PageTableMut) -> AxResult {
         debug!("Cow::unmap: {range:?}");
+        let mut va = range.start;
+        let end = range.end;
+        let backend_page_size = self.size as usize;
+        while va < end {
+            match pt.query(va) {
+                Ok((paddr, _old_flags, page_size)) => {
+                    if page_size == PageSize::Size2M 
+                    && backend_page_size == PAGE_SIZE_4K {
+                        let va_usize: usize = va.into();
+                        let end_usize: usize = end.into();
+                        let huge_start = va_usize & !(PAGE_SIZE_2M - 1);
+                        let huge_end = huge_start + PAGE_SIZE_2M;
+
+                        if va_usize == huge_start && huge_end <= end_usize {
+                            let base_va: VirtAddr = huge_start.into();
+                            let (base_pa, _, _) = pt.query(base_va)?;
+
+                            for offset in (0..PAGE_SIZE_2M).step_by(PAGE_SIZE_4K) {
+                                dec_frame_ref(base_pa + offset);
+                            }
+
+                            pt.unmap(base_va)?;
+                            va = (base_va + PAGE_SIZE_2M).into();
+                            continue;
+                        }
+
+                        // Otherwise split the THP in the old page table
+                        // and retry at 4K granularity.
+                        pt.split_huge_pmd(va)?;
+                        continue;
+                    } else {
+                        dec_frame_ref(paddr);
+                        pt.unmap(va)?;
+                        let step: usize = page_size.into();
+                        va += step;
+                    }
+                }
+                Err(_) => {
+                    va += backend_page_size;
+                }
+            }
+        }
+
         for addr in pages_in(range, self.size)? {
             if let Ok((frame, _flags, page_size)) = pt.unmap(addr) {
-                assert_eq!(page_size, self.size);
+                // With khugepaged
+                // Page size may not equal to `self.size`
                 if dec_frame_ref(frame) == 1 {
-                    dealloc_frame(frame, self.size);
+                    dealloc_frame(frame, page_size);
                 }
             } else {
                 // Deallocation is needn't if the page is not allocated.
@@ -140,39 +277,70 @@ impl BackendOps for CowBackend {
         Ok(())
     }
 
+    fn pte_fault_collapse(
+        &self,
+        vaddr: VirtAddr,
+        flags: MappingFlags,
+        _access_flags: MappingFlags,
+        pt: &mut PageTableMut,
+    ) -> AxResult<(usize, Option<Box<dyn FnOnce(&mut AddrSpace)>>)> {
+        let m_range = VirtAddrRange::from_start_size(vaddr, PageSize::Size2M as _);
+        for addr in pages_in(m_range, PageSize::Size4K)? {
+            if pt.query(addr).is_ok() {
+                return Err(PagingError::NotMapped.into());
+            }
+        }
+
+        let frame = alloc_frame(true, PageSize::Size2M)?;
+
+        pt.map(vaddr, frame, PageSize::Size2M, flags)?;
+        return Ok((1, None))
+    }
+
     fn populate(
         &self,
         range: VirtAddrRange,
         flags: MappingFlags,
         access_flags: MappingFlags,
         pt: &mut PageTableMut,
-    ) -> AxResult<(usize, Option<Box<dyn FnOnce(&mut AddrSpace)>>)> {
+        ) -> AxResult<(usize, Option<Box<dyn FnOnce(&mut AddrSpace)>>)> {
         let mut pages = 0;
-        for addr in pages_in(range, self.size)? {
-            match pt.query(addr) {
+        let mut va = range.start;
+        let end = range.end;
+        let backend_page_size: usize = self.size as usize;
+
+        while va < end {
+            match pt.query(va) {
                 Ok((paddr, page_flags, page_size)) => {
-                    assert_eq!(self.size, page_size);
+                    if page_size == PageSize::Size2M && backend_page_size == PAGE_SIZE_4K {
+                        pt.split_huge_pmd(va)?;
+                        continue;
+                    }
                     if access_flags.contains(MappingFlags::WRITE)
                         && !page_flags.contains(MappingFlags::WRITE)
                     {
-                        self.handle_cow_fault(addr, paddr, flags, pt)?;
+                        self.handle_cow_fault(va, paddr, flags, pt)?;
                         pages += 1;
                     } else if page_flags.contains(access_flags) {
                         pages += 1;
-                    }
+                    } 
+                    va += backend_page_size;
                 }
                 // If the page is not mapped, try map it.
                 Err(PagingError::NotMapped) => {
-                    self.alloc_new_at(addr, flags, pt)?;
+                    // Allocate one backend-sized page starting at `va`.
+                    self.alloc_new_at(va, flags, pt)?;
                     pages += 1;
+                    va += backend_page_size;
                 }
                 Err(_) => return Err(AxError::BadAddress),
             }
         }
+
         Ok((pages, None))
     }
 
-    fn clone_map(
+fn clone_map(
         &self,
         range: VirtAddrRange,
         flags: MappingFlags,
@@ -181,25 +349,54 @@ impl BackendOps for CowBackend {
         _new_aspace: &Arc<Mutex<AddrSpace>>,
     ) -> AxResult<Backend> {
         let cow_flags = flags - MappingFlags::WRITE;
+        let mut va = range.start;
+        let end = range.end;
+        let backend_page_size = self.size as usize;
+        while va < end {
+            match old_pt.query(va) {
+                Ok((paddr, _old_flags, page_size)) => {
+                    if page_size == PageSize::Size2M  && 
+                    backend_page_size == PAGE_SIZE_4K {
+                        let va_usize: usize = va.into();
+                        let end_usize: usize = end.into();
+                        let huge_start = va_usize & !(PAGE_SIZE_2M - 1);
+                        let huge_end = huge_start + PAGE_SIZE_2M;
 
-        for vaddr in pages_in(range, self.size)? {
-            // Copy data from old memory area to new memory area.
-            match old_pt.query(vaddr) {
-                Ok((paddr, _, page_size)) => {
-                    assert_eq!(page_size, self.size);
-                    // If the page is mapped in the old page table:
-                    // - Update its permissions in the old page table using `flags`.
-                    // - Map the same physical page into the new page table at the same
-                    // virtual address, with the same page size and `flags`.
-                    inc_frame_ref(paddr);
+                        // If the clone range fully covers this THP and we
+                        // are at its base, keep it as a huge mapping and
+                        // bump refs for all 4K pages underneath.
+                        if va_usize == huge_start && huge_end <= end_usize {
+                            let base_va: VirtAddr = huge_start.into();
+                            let (base_pa, _f, _s) = old_pt.query(base_va)?;
 
-                    old_pt.protect(vaddr, cow_flags)?;
-                    new_pt.map(vaddr, paddr, self.size, cow_flags)?;
+                            for offset in (0..PAGE_SIZE_2M).step_by(PAGE_SIZE_4K) {
+                                inc_frame_ref(base_pa + offset);
+                            }
+
+                            old_pt.protect(base_va, cow_flags)?;
+                            new_pt.map(base_va, base_pa, PageSize::Size2M, cow_flags)?;
+                            va = (base_va + PAGE_SIZE_2M).into();
+                            continue;
+                        }
+
+                        // Otherwise split the THP in the old page table
+                        // and retry at 4K granularity.
+                        old_pt.split_huge_pmd(va)?;
+                        continue;
+                    } else {
+                        inc_frame_ref(paddr);
+                        old_pt.protect(va, cow_flags)?;
+                        new_pt.map(va, paddr, page_size, cow_flags)?;
+                        let step: usize = page_size.into();
+                        va += step;
+                    }
                 }
                 // If the page is not mapped, skip it.
-                Err(PagingError::NotMapped) => {}
+                Err(PagingError::NotMapped) => {
+                    va += backend_page_size;
+                }
                 Err(_) => return Err(AxError::BadAddress),
-            };
+            }
         }
 
         Ok(Backend::Cow(self.clone()))
@@ -218,6 +415,7 @@ impl Backend {
             start,
             size,
             file: Some((file, file_start, file_end)),
+            vma_flags: Arc::new(VmaFlagsWrapper(VmaFlags::empty().into())),
         })
     }
 
@@ -226,6 +424,7 @@ impl Backend {
             start,
             size,
             file: None,
+            vma_flags: Arc::new(VmaFlagsWrapper(VmaFlags::empty().into()))
         })
     }
 }

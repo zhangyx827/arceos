@@ -9,13 +9,15 @@ use memory_addr::{MemoryAddr, PhysAddr, VirtAddr, VirtAddrRange};
 use super::{alloc_frame, dealloc_frame};
 use crate::{
     AddrSpace,
-    backend::{Backend, BackendOps, divide_page, pages_in},
+    backend::{Backend, BackendOps, VmaFlags, current_ano_policy, divide_page, pages_in},
 };
 
 pub struct SharedPages {
     pub phys_pages: Vec<PhysAddr>,
     pub size: PageSize,
 }
+
+
 impl SharedPages {
     pub fn new(size: usize, page_size: PageSize) -> AxResult<Self> {
         Ok(Self {
@@ -51,11 +53,14 @@ impl Drop for SharedPages {
     }
 }
 
+pub struct VmaFlagsWrapper(Mutex<VmaFlags>);
+
 // FIXME: This implementation does not allow map or unmap partial ranges.
 #[derive(Clone)]
 pub struct SharedBackend {
     start: VirtAddr,
     pages: Arc<SharedPages>,
+    vma_flags: Arc<VmaFlagsWrapper>,
 }
 impl SharedBackend {
     pub fn pages(&self) -> &Arc<SharedPages> {
@@ -70,6 +75,29 @@ impl SharedBackend {
 }
 
 impl BackendOps for SharedBackend {
+    fn collapse_page(
+        &self,
+        _m_start: VirtAddr,
+        _m_end: VirtAddr,
+        _pt: &mut PageTableMut,
+    ) -> AxResult {
+        // Shared mappings currently do not support THP collapse.
+        Ok(())
+    }
+
+    fn set_vma_flag(&self, vma_flags: VmaFlags) {
+        *self.vma_flags.0.lock() |= vma_flags;
+    }
+
+    fn clear_vma_flag(&self, vma_flags: VmaFlags) {
+        *self.vma_flags.0.lock() ^= vma_flags;
+    }
+
+    fn transparent_hugepage_enabled(&self) -> bool {
+        return *self.vma_flags.0.lock() == VmaFlags::HUGEPAGE
+        || current_ano_policy().eq("always\n");
+    }
+
     fn page_size(&self) -> PageSize {
         self.pages.size
     }
@@ -102,10 +130,11 @@ impl BackendOps for SharedBackend {
     ) -> AxResult<Backend> {
         Ok(Backend::Shared(self.clone()))
     }
+
 }
 
 impl Backend {
     pub fn new_shared(start: VirtAddr, pages: Arc<SharedPages>) -> Self {
-        Self::Shared(SharedBackend { start, pages })
+        Self::Shared( SharedBackend {start, pages, vma_flags: Arc::new(VmaFlagsWrapper { 0: VmaFlags::empty().into() }) })
     }
 }
