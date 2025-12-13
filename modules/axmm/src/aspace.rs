@@ -1,4 +1,4 @@
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 use page_table_multiarch::PageSize;
 use core::{fmt, ops::DerefMut};
 
@@ -12,11 +12,8 @@ use axsync::Mutex;
 use memory_addr::{
     MemoryAddr, PAGE_SIZE_4K, PAGE_SIZE_2M, PageIter4K, PhysAddr, VirtAddr, VirtAddrRange, is_aligned_4k,
 };
-use memory_set::{MemoryArea, MemorySet};
-
-use crate::{backend::Backend, backend::BackendOps};
-
-// use axhal::paging::PageSize;
+use memory_set::{MappingError, MemoryArea, MemorySet};
+use crate::backend::{Backend, BackendOps, VmaFlags};
 
 
 /// The virtual memory address space.
@@ -31,6 +28,14 @@ pub enum ScanResult {
     ScanContinue,
     ScanFinished,
     ScanMmExit,
+}
+
+fn map_mapping_err(err: MappingError) -> AxError {
+    match err {
+        MappingError::InvalidParam => AxError::InvalidInput,
+        MappingError::AlreadyExists => AxError::AlreadyExists,
+        MappingError::BadState => AxError::BadState,
+    }
 }
 
 impl AddrSpace {
@@ -148,7 +153,9 @@ impl AddrSpace {
 
         let offset = start_vaddr.as_usize() as isize - start_paddr.as_usize() as isize;
         let area = MemoryArea::new(start_vaddr, size, flags, Backend::new_linear(offset));
-        self.areas.map(area, &mut self.pt, false)?;
+        self.areas
+            .map(area, &mut self.pt, false)
+            .map_err(map_mapping_err)?;
         Ok(())
     }
 
@@ -163,7 +170,9 @@ impl AddrSpace {
         self.validate_region(start, size)?;
 
         let area = MemoryArea::new(start, size, flags, backend);
-        self.areas.map(area, &mut self.pt, false)?;
+        self.areas
+            .map(area, &mut self.pt, false)
+            .map_err(map_mapping_err)?;
         if populate {
             self.populate_area(start, size, flags)?;
         }
@@ -208,7 +217,9 @@ impl AddrSpace {
     pub fn unmap(&mut self, start: VirtAddr, size: usize) -> AxResult {
         self.validate_region(start, size)?;
 
-        self.areas.unmap(start, size, &mut self.pt)?;
+        self.areas
+            .unmap(start, size, &mut self.pt)
+            .map_err(map_mapping_err)?;
         Ok(())
     }
 
@@ -278,8 +289,22 @@ impl AddrSpace {
         self.validate_region(start, size)?;
 
         self.areas
-            .protect(start, size, |_| Some(flags), &mut self.pt)?;
+            .protect(start, size, |_| Some(flags), &mut self.pt)
+            .map_err(map_mapping_err)?;
 
+        Ok(())
+    }
+    
+    /// Split the area within the specified virtual address range.
+    ///
+    /// Returns an error if the address range is out of the address space or not
+    /// aligned.
+    pub fn split(&mut self, start: VirtAddr, size: usize) -> AxResult {
+        if size == 0 {
+            return Ok(());
+        }
+        self.validate_region(start, size)?;
+        self.areas.split_range(start, size).map_err(map_mapping_err)?;
         Ok(())
     }
 
@@ -376,7 +401,7 @@ impl AddrSpace {
 
         let mut guard = new_aspace.lock();
 
-        let mut self_modify = self.pt.modify();
+	        let mut self_modify = self.pt.modify();
         for area in self.areas.iter() {
             let new_backend = area.backend().clone_map(
                 area.va_range(),
@@ -386,9 +411,13 @@ impl AddrSpace {
                 &new_aspace_clone,
             )?;
 
-            let new_area = MemoryArea::new(area.start(), area.size(), area.flags(), new_backend);
+            let new_area =
+                MemoryArea::new(area.start(), area.size(), area.flags(), new_backend);
             let aspace = guard.deref_mut();
-            aspace.areas.map(new_area, &mut aspace.pt, false)?;
+            aspace
+                .areas
+                .map(new_area, &mut aspace.pt, false)
+                .map_err(map_mapping_err)?;
         }
         drop(guard);
 
@@ -415,15 +444,17 @@ impl AddrSpace {
 
     pub fn try_collapse_page(
         &mut self,
-        pages_scan: &mut usize,
-        max_pte_none: usize, 
+        pages_scanned: &mut usize,
+        max_pte_none: usize,
         pages_to_scan: usize,
+        max_pte_shared: usize,
         pages_collapsed: &mut usize,
     ) -> ScanResult {
         let (backend, mut vaddr, area_end) = match self.next_area() {
             None => return ScanResult::ScanFinished,
             Some(area) => {
-                if !area.backend().transparent_hugepage_enabled() {
+                if !area.backend().transparent_hugepage_enabled() 
+                || area.backend().contain_vma_flag(VmaFlags::VM_STACK) {
                     self.advance_scan_cursor(area.end());
                     return ScanResult::ScanContinue;
                 }
@@ -435,38 +466,115 @@ impl AddrSpace {
             }
         };
 
-        while *pages_scan < pages_to_scan && vaddr + PAGE_SIZE_2M <= area_end {
-            let m_start = vaddr;
-            let m_end = vaddr + PAGE_SIZE_2M;
-            if let Ok((_, _, page_size)) = self.pt.query(vaddr) {
-                if page_size == PageSize::Size2M {
-                    vaddr += PAGE_SIZE_2M;
-                    *pages_scan += PAGE_SIZE_2M / PAGE_SIZE_4K;
-                    continue;
-                }
-            }          
+        while *pages_scanned < pages_to_scan && vaddr + PAGE_SIZE_2M <= area_end {
+            let range = VirtAddrRange::new(vaddr, vaddr + PAGE_SIZE_2M);
+            let before = *pages_scanned;
 
-            let mut pte_none = 0;
-            for page_va in PageIter4K::new(m_start, m_end).expect("4KB aligned range") {
-                if self.pt.query(page_va).is_err() {
-                    pte_none += 1;
+            let collapsed = backend
+                .try_collapse_page(
+                    range,
+                    &mut self.pt.modify(),
+                    max_pte_none,
+                    max_pte_shared,
+                    pages_scanned,
+                    pages_to_scan,
+                )
+                .unwrap_or(false);
 
-                    if pte_none > max_pte_none {
-                        break;
-                    }
-                }
-            }
-
-            if pte_none < max_pte_none {
-                let _ = backend.collapse_page(m_start, m_end, &mut self.pt.modify());
+            if collapsed {
                 *pages_collapsed += PAGE_SIZE_2M / PAGE_SIZE_4K;
             }
+
+            let scanned_in_window = *pages_scanned - before;
+            if scanned_in_window < PAGE_SIZE_2M / PAGE_SIZE_4K && *pages_scanned >= pages_to_scan {
+                // Budget exhausted in the middle of this 2 MiB window.
+                // Do not advance vaddr so that we can resume from here next time.
+                break;
+            }
+
             vaddr += PAGE_SIZE_2M;
-            *pages_scan += PAGE_SIZE_2M / PAGE_SIZE_4K;
         }
 
         self.advance_scan_cursor(area_end);
         ScanResult::ScanContinue
+    }
+
+    pub fn collapse_page_range(
+        &mut self,
+        start: VirtAddr,
+        len: usize,
+    ) -> AxResult<isize> {
+        let end = start + len;
+        let mut vaddr = start;
+        let mut last_err = None;
+
+        while let Some(area) = self.areas.find(vaddr) {
+            if area.backend().contain_vma_flag(
+                VmaFlags::VM_HUGETLB
+                | VmaFlags::VM_IO
+                | VmaFlags::VM_DONTEXPAND
+                | VmaFlags::VM_MIXEDMAP
+                | VmaFlags::VM_PFNMAP
+                | VmaFlags::VM_NOHUGEPAGE
+                | VmaFlags::VM_STACK
+            ) {
+                return Err(AxError::InvalidInput);
+            }
+
+            let area_end = area.end().min(end);
+            vaddr = vaddr.align_up(PageSize::Size2M);
+
+            let backend = area.backend().clone();
+            while vaddr + PAGE_SIZE_2M <= area_end {
+                // Already PMD‑mapped THP
+                if let Ok((_, _, page_size)) = self.pt.query(vaddr) {
+                    if page_size == PageSize::Size2M {
+                        vaddr += PAGE_SIZE_2M;
+                        continue;
+                    }
+                }
+                // File-backed (non in-memory) mappings only support THP on read-only VMAs.
+                if let Backend::File(file_backend) = &backend {
+                    if !file_backend.is_in_memory() {
+                        if let Ok((_, pte_flags, _)) = self.pt.query(vaddr) {
+                            if pte_flags.contains(MappingFlags::WRITE) {
+                                last_err = Some(AxError::InvalidInput);
+                                vaddr += PAGE_SIZE_2M;
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                let range = VirtAddrRange::new(vaddr, vaddr + PAGE_SIZE_2M);
+                let mut callbacks = Vec::new();
+                match backend.collapse_page(range, &mut self.pt.modify(), true, Some(&mut callbacks))
+                {
+                    Ok(_) => {},
+                    Err(e) => { last_err = Some(e); }
+                }
+
+                for cb in callbacks {
+                    cb(self);
+                }
+                
+                vaddr += PAGE_SIZE_2M;
+            }
+            vaddr = area_end;
+            if vaddr >= end {
+                break;
+            }
+        }
+
+        if vaddr < end {
+            // If the area is not fully mapped, we return ENOMEM.
+            ax_bail!(NoMemory);
+        }
+
+        match last_err {
+            None => Ok(0),
+            Some(e) => Err(e),
+        }
     }
 }
 

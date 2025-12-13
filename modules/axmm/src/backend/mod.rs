@@ -1,8 +1,9 @@
 //! Memory mapping backends.
-use alloc::{boxed::Box, sync::Arc};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 
 use axalloc::{UsageKind, global_allocator};
 use axerrno::{AxError, AxResult};
+use axfs_ng::CachedFile;
 use axhal::{
     mem::{phys_to_virt, virt_to_phys},
     paging::{MappingFlags, PageSize, PageTable, PageTableMut},
@@ -18,8 +19,9 @@ pub mod file;
 pub mod linear;
 pub mod shared;
 
-pub use shared::SharedPages;
-pub use cow::{current_ano_policy, modify_ano_policy};
+use page_table_multiarch::PagingError;
+pub use shared::{current_shmem_thp_policy, set_shmem_thp_policy};
+pub use cow::{current_thp_policy, frame_ref_count, set_thp_policy};
 
 use crate::AddrSpace;
 
@@ -50,6 +52,66 @@ fn dealloc_frame(frame: PhysAddr, align: PageSize) {
 
 fn pages_in(range: VirtAddrRange, align: PageSize) -> AxResult<DynPageIter<VirtAddr>> {
     DynPageIter::new(range.start, range.end, align as usize).ok_or(AxError::InvalidInput)
+}
+
+fn register_cache_listener<T>(
+    cache: &CachedFile,
+    backend: &Arc<T>,
+    aspace: &Arc<Mutex<AddrSpace>>,
+    on_evict: impl Fn(&Arc<T>, u32, &mut AddrSpace) + Send + Sync + 'static,
+) -> usize 
+where 
+    T: Send + Sync + 'static,
+{
+    let backend_w = Arc::downgrade(backend);
+    let aspace_w = Arc::downgrade(aspace);
+    cache.add_evict_listener(move |pn, _page| {
+        let Some(backend) = backend_w.upgrade() else { return; };
+        let Some(aspace) = aspace_w.upgrade() else { return; };
+        let Some(mut aspace) = aspace.try_lock() else { return; };
+        on_evict(&backend, pn, &mut aspace);
+    })
+}
+
+trait EvictMatch {
+    fn matches_backend(&self, backend: &Backend) -> bool;
+}
+
+impl EvictMatch for file::FileBackendInner {
+    fn matches_backend(&self, backend: &Backend) -> bool {
+        matches!(backend, Backend::File(file) if file.ptr_eq_inner(self))
+    }
+}
+
+impl EvictMatch for shared::SharedBackendInner {
+    fn matches_backend(&self, backend: &Backend) -> bool {
+        matches!(backend, Backend::Shared(shared) if shared.ptr_eq_inner(self))
+    }
+}
+
+fn on_evict<T>(
+    backend: &Arc<T>, 
+    vaddr: VirtAddr,
+    aspace: &mut AddrSpace
+)
+where
+    T: EvictMatch,
+{
+    if !aspace
+        .find_area(vaddr)
+        .is_some_and(|it| backend.matches_backend(it.backend()))
+    {
+        // Ignore if the page is not controlled by this file mapping.
+        return;
+    }
+
+    let pt = aspace.page_table_mut();
+    match pt.modify().unmap(vaddr) {
+        Ok(_) | Err(PagingError::NotMapped) => {}
+        Err(err) => {
+            warn!("Failed to unmap page {:?}: {:?}", vaddr, err);
+        }
+    }
 }
 
 #[enum_dispatch]
@@ -88,16 +150,6 @@ pub trait BackendOps {
         Ok((0, None))
     }
     
-    /// Populate a memory region using PMD-sized page. Returns number of pages populated.
-    fn pte_fault_collapse(
-        &self,
-        _vaddr: VirtAddr,
-        _flags: MappingFlags,
-        _access_flags: MappingFlags,
-        _pt: &mut PageTableMut,
-    ) -> AxResult<(usize, Option<Box<dyn FnOnce(&mut AddrSpace)>>)> {
-        Ok((0, None))
-    }
     /// Duplicates this mapping for use in a different page table.
     ///
     /// This differs from `clone`, which is designed for splitting a mapping
@@ -113,14 +165,44 @@ pub trait BackendOps {
         new_aspace: &Arc<Mutex<AddrSpace>>,
     ) -> AxResult<Backend>;
 
-    /// Modify the thp policy
-    fn clear_vma_flag(&self, vma_flags: VmaFlags);
-    
-    fn set_vma_flag(&self, vma_flags: VmaFlags);
-    
+    /// Set per-VMA THP-related flags (e.g. VM_HUGEPAGE / VM_NOHUGEPAGE).
+    fn set_vma_flag(&self, flag: VmaFlags);
+
+    /// Clear per-VMA THP-related flags.
+    fn clear_vma_flag(&self, flag: VmaFlags);
+
+    /// Contain the per-VMA THP-related flag 
+    fn contain_vma_flag(&self, flag: VmaFlags) -> bool;
+
     fn transparent_hugepage_enabled(&self) -> bool;
 
-    fn collapse_page(&self, m_start: VirtAddr, m_end: VirtAddr, pt: &mut PageTableMut) -> AxResult;
+    /// Backend-specific THP collapse attempt on a single 2 MiB window.
+    ///
+    /// - `range` is a 2 MiB‑aligned virtual address window.
+    /// - `pt` is the page table to operate on.
+    /// - `max_ptes_none` / `max_ptes_shared` are collapse heuristics.
+    /// - `pages_scanned` is increased by the number of 4 KiB pages examined,
+    ///   and must never exceed `pages_to_scan`.
+    ///
+    /// Returns `Ok(true)` if a collapse actually happened, `Ok(false)` if the
+    /// backend decided not to collapse this window, and `Err(_)` on failure.
+    fn try_collapse_page(
+        &self,
+        range: VirtAddrRange,
+        pt: &mut PageTableMut,
+        max_ptes_none: usize,
+        max_ptes_shared: usize,
+        pages_scanned: &mut usize,
+        pages_to_scan: usize,
+    ) -> AxResult<bool>;
+
+    fn collapse_page(
+        &self,
+        range: VirtAddrRange,
+        pt: &mut PageTableMut,
+        fault_in: bool,
+        callbacks: Option<&mut Vec<Box<dyn FnOnce(&mut AddrSpace)>>>,
+    ) -> AxResult;
 }
 
 /// A unified enum type for different memory mapping backends.
@@ -173,10 +255,21 @@ impl MappingBackend for Backend {
 bitflags! {
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub struct VmaFlags: usize {
-        /// madvise(MADV_HUGEPAGE): 允许THP collapse
-        const HUGEPAGE    = 1 << 21;  // 匹配Linux VM_HUGEPAGE
-        /// madvise(MADV_NOHUGEPAGE): 禁用THP
-        const NOHUGEPAGE  = 1 << 22;  // 匹配Linux VM_NOHUGEPAGE
-        // 可扩展：MADV_WILLNEED=1<<10, MADV_DONTNEED=1<<11 等
+        /// Currently indicate it is a stack memory
+        const VM_STACK	 = 0x0000_0100;
+        /// Page-ranges managed without `struct page`, pure PFNs (Linux VM_PFNMAP).
+        const VM_PFNMAP      = 0x0000_0400;
+        /// Memory-mapped I/O or similar (Linux VM_IO).
+        const VM_IO          = 0x0000_4000;
+        /// Cannot expand with mremap() (Linux VM_DONTEXPAND).
+        const VM_DONTEXPAND  = 0x0004_0000;
+        /// HugeTLB mapping (Linux VM_HUGETLB).
+        const VM_HUGETLB     = 0x0040_0000;
+        /// Mapping may contain both struct page and pure PFN pages (Linux VM_MIXEDMAP).
+        const VM_MIXEDMAP    = 0x1000_0000;
+        /// madvise(MADV_HUGEPAGE): mark VMA as THP candidate (Linux VM_HUGEPAGE).
+        const VM_HUGEPAGE    = 0x2000_0000;
+        /// madvise(MADV_NOHUGEPAGE): forbid THP on this VMA (Linux VM_NOHUGEPAGE).
+        const VM_NOHUGEPAGE  = 0x4000_0000;
     }
 }

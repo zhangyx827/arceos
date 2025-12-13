@@ -7,7 +7,7 @@ pub use axplat::mem::{
 use axplat::mem::{check_sorted_ranges_overlap, ranges_difference};
 use heapless::Vec;
 use lazyinit::LazyInit;
-pub use memory_addr::{PAGE_SIZE_4K, PhysAddr, PhysAddrRange, VirtAddr, VirtAddrRange, pa, va};
+pub use memory_addr::{PhysAddr, PhysAddrRange, VirtAddr, VirtAddrRange, pa, va};
 
 const MAX_REGIONS: usize = 128;
 

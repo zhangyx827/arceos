@@ -79,9 +79,13 @@ lazy_static = { version = "1.5", features = ["spin_no_std"] }
 lazyinit = "0.2"
 lock_api = { version = "0.4", default-features = false }
 log = "0.4"
-memory_addr = "0.4"
+memory_addr = { path = "../../axmm_crates/memory_addr" }
 page_table_entry = "0.5"
 page_table_multiarch = "0.5"
 percpu = "0.2"
 scope-local = "0.1"
 spin = "0.10"
+
+[patch.crates-io]
+page_table_entry = { path = "../../page_table_multiarch1/page_table_entry" }
+page_table_multiarch = { path = "../../page_table_multiarch1/page_table_multiarch" }

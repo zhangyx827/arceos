@@ -25,10 +25,12 @@ axtask = { workspace = true }
 axerrno = { workspace = true }
 enum_dispatch = { workspace = true }
 kspin = { workspace = true }
+spin = { workspace = true }
+lru = "0.16.0"
 lazyinit = { workspace = true }
 log = { workspace = true }
 memory_addr = { workspace = true }
-memory_set = { version = "0.4", features = ["axerrno"] }
+memory_set = { path = "../../../../axmm_crates/memory_set" }
 page_table_multiarch = { workspace = true, optional = true }
 bitflags = "2.10"
 lazy_static = { workspace = true }

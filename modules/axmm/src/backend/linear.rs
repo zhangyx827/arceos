@@ -1,4 +1,4 @@
-use alloc::sync::Arc;
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 
 use axerrno::AxResult;
 use axhal::paging::{MappingFlags, PageSize, PageTableMut};
@@ -27,26 +27,47 @@ impl LinearBackend {
 }
 
 impl BackendOps for LinearBackend {
+    fn try_collapse_page(
+        &self,
+        _range: VirtAddrRange,
+        _pt: &mut PageTableMut,
+        _max_ptes_none: usize,
+        _max_ptes_shared: usize,
+        _pages_scanned: &mut usize,
+        _pages_to_scan: usize,
+    ) -> AxResult<bool> {
+        // Linear backend does not support THP collapse.
+        Ok(false)
+    }
+
     fn collapse_page(
         &self,
-        _m_start: VirtAddr,
-        _m_end: VirtAddr,
+        _range: VirtAddrRange,
         _pt: &mut PageTableMut,
+        _fault_in: bool,
+        _callbacks: Option<&mut Vec<Box<dyn FnOnce(&mut AddrSpace)>>>,
     ) -> AxResult {
-        // Linear backend does not support THP collapse; no-op.
+        // Linear backend does not support THP collapse.
         Ok(())
     }
-    
-    fn set_vma_flag(&self, _vma_flags:VmaFlags) {
-        unimplemented!()
+
+    fn set_vma_flag(&self, _vma_flags: VmaFlags) {
+        // Linear mappings do not participate in THP policy.
     }
+
+    fn clear_vma_flag(&self, _vma_flags: VmaFlags) {
+        // Linear mappings do not participate in THP policy.
+    }
+
     fn transparent_hugepage_enabled(&self) -> bool {
         false
     }
-    
-    fn clear_vma_flag(&self, _vma_flags: VmaFlags) {
-        unimplemented!()
+
+    fn contain_vma_flag(&self, _flag: VmaFlags) -> bool {
+        // Linear mappings do not participate in THP policy.
+        false
     }
+
 
     fn page_size(&self) -> PageSize {
         PageSize::Size4K

@@ -9,6 +9,8 @@ config_args := \
 ifeq ($(MYPLAT),)
   # Only change these options if targeting QEMU
   config_args += -w 'plat.phys-memory-size=$(shell numfmt --from=iec $(MEM))'
+  # Enlarge boot stack size for debug/feature-heavy kernels (default 256K → 512K)
+  config_args += -w 'plat.boot-stack-size=0x80000'
   ifneq ($(SMP),)
     config_args += -w 'plat.cpu-num=$(SMP)'
   else
