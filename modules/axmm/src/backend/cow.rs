@@ -17,33 +17,66 @@ use axhal::{
 use axsync::Mutex;
 use kspin::SpinNoIrq;
 use lazy_static::lazy_static;
-use memory_addr::{MemoryAddr, PAGE_SIZE_2M, PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange};
+use memory_addr::{MemoryAddr, PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange};
 
 use crate::{
-    AddrSpace, backend::{Backend, BackendOps, VmaFlags, alloc_frame, dealloc_frame, pages_in}
+    AddrSpace,
+    THP_PAGE_BYTES,
+    backend::{Backend, BackendOps, VmaFlags, alloc_frame, dealloc_frame, pages_in},
 };
 
 static FRAME_TABLE: SpinNoIrq<BTreeMap<PhysAddr, u8>> = SpinNoIrq::new(BTreeMap::new());
 
-// Global THP policy controlled through
-// /sys/kernel/mm/transparent_hugepage/enabled
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThpPolicy {
+    Always,
+    Madvise,
+    Never,
+}
+
+impl ThpPolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::Madvise => "madvise",
+            Self::Never => "never",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "always" => Some(Self::Always),
+            "madvise" => Some(Self::Madvise),
+            "never" => Some(Self::Never),
+            _ => None,
+        }
+    }
+}
+
+// Global THP policy controlled through `/sys/kernel/mm/transparent_hugepage/enabled`.
 lazy_static! {
-    static ref GLOBAL_THP_POLICY: SpinNoIrq<String> =
-        SpinNoIrq::new(String::from("madvise"));
+    static ref GLOBAL_THP_POLICY: SpinNoIrq<ThpPolicy> = SpinNoIrq::new(ThpPolicy::Madvise);
 }
 
 /// Updates the global THP policy string (e.g. "always", "madvise", "never").
 pub fn set_thp_policy(policy: &str) -> VfsResult<Vec<u8>> {
-    if policy != "never" && policy != "madvise" && policy != "always" && !policy.is_empty() {
-        return Err(VfsError::InvalidInput);
+    // Some writers may perform a truncate-like write with an empty buffer before
+    // writing the real contents (even though sysfs normally doesn't require
+    // this). Treat empty writes as a no-op for robustness.
+    let trimmed = policy.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
     }
-    *GLOBAL_THP_POLICY.lock() = alloc::format!("{policy}");
+    let Some(policy) = ThpPolicy::parse(trimmed) else {
+        return Err(VfsError::InvalidInput);
+    };
+    *GLOBAL_THP_POLICY.lock() = policy;
     Ok(Vec::new())
 }
 
-/// Returns the current global THP policy string (including trailing '\n').
+/// Returns the current global THP policy string 
 pub fn current_thp_policy() -> String {
-    GLOBAL_THP_POLICY.lock().clone()
+    GLOBAL_THP_POLICY.lock().as_str().into()
 }
 
 /// Returns the approximate reference count for a given frame managed by COW.
@@ -252,7 +285,7 @@ impl BackendOps for CowBackend {
             return Err(AxError::BadAddress);
         }
 
-        for offset in (0..PAGE_SIZE_2M).step_by(PAGE_SIZE_4K) {
+        for offset in (0..THP_PAGE_BYTES).step_by(PAGE_SIZE_4K) {
             inc_frame_ref(new_pa + offset);
         }
 
@@ -273,14 +306,6 @@ impl BackendOps for CowBackend {
         pages_scanned: &mut usize,
         pages_to_scan: usize,
     ) -> AxResult<bool> {
-        // If this window is already mapped as a huge page, just account and skip.
-        if let Ok((_, _, page_size)) = pt.query(range.start) {
-            if page_size == PageSize::Size2M {
-                *pages_scanned += PAGE_SIZE_2M / PAGE_SIZE_4K;
-                return Ok(false);
-            }
-        }
-
         let mut pte_none = 0;
         let mut shared_ptes = 0;
 
@@ -314,17 +339,13 @@ impl BackendOps for CowBackend {
     }
 
     fn set_vma_flag(&self, flag: VmaFlags) {
-        if current_thp_policy().eq("madvise") {
-            let mut v = self.vma_flags.lock();
-            *v |= flag;
-        }
+        let mut v = self.vma_flags.lock();
+        *v |= flag;
     }
 
     fn clear_vma_flag(&self, flag: VmaFlags) {
-        if current_thp_policy().eq("madvise") {
-            let mut v = self.vma_flags.lock();
-            *v ^= flag;
-        }
+        let mut v = self.vma_flags.lock();
+        v.remove(flag);
     }
 
     fn contain_vma_flag(&self, flag: VmaFlags) -> bool {
@@ -333,8 +354,15 @@ impl BackendOps for CowBackend {
 
     fn transparent_hugepage_enabled(&self) -> bool {
         let v = *self.vma_flags.lock();
-        v.contains(VmaFlags::VM_HUGEPAGE)
-            || current_thp_policy().eq("always\n")
+        if v.contains(VmaFlags::VM_NOHUGEPAGE) {
+            return false;
+        }
+
+        match *GLOBAL_THP_POLICY.lock() {
+            ThpPolicy::Always => true,
+            ThpPolicy::Madvise => v.contains(VmaFlags::VM_HUGEPAGE),
+            ThpPolicy::Never => false,
+        }
     }
 
     fn page_size(&self) -> PageSize {
@@ -365,8 +393,8 @@ impl BackendOps for CowBackend {
                     && backend_page_size == PAGE_SIZE_4K {
                         let va_usize: usize = va.into();
                         let end_usize: usize = end.into();
-                        let huge_start = va_usize & !(PAGE_SIZE_2M - 1);
-                        let huge_end = huge_start + PAGE_SIZE_2M;
+                        let huge_start = va_usize & !(THP_PAGE_BYTES - 1);
+                        let huge_end = huge_start + THP_PAGE_BYTES;
                         // If the page is a THP and start address
                         // is aligned, the range contain the 
                         // THP range, unmap the whole THP 
@@ -375,12 +403,14 @@ impl BackendOps for CowBackend {
                             let base_va: VirtAddr = huge_start.into();
                             let (base_pa, _, _) = pt.query(base_va)?;
 
-                            for offset in (0..PAGE_SIZE_2M).step_by(PAGE_SIZE_4K) {
-                                dec_frame_ref(base_pa + offset);
+                            for offset in (0..THP_PAGE_BYTES).step_by(PAGE_SIZE_4K) {
+                                if dec_frame_ref(base_pa + offset) == 1 {
+                                    dealloc_frame(base_pa + offset, PageSize::Size4K);
+                                }
                             }
 
                             pt.unmap(base_va)?;
-                            va = (base_va + PAGE_SIZE_2M).into();
+                            va = (base_va + THP_PAGE_BYTES).into();
                             continue;
                         }
 
@@ -389,7 +419,9 @@ impl BackendOps for CowBackend {
                         pt.split_huge_pmd(va)?;
                         continue;
                     } else {
-                        dec_frame_ref(paddr);
+                        if dec_frame_ref(paddr) == 1 {
+                            dealloc_frame(paddr, page_size);
+                        }
                         pt.unmap(va)?;
                         let step: usize = page_size.into();
                         va += step;
@@ -480,20 +512,20 @@ fn clone_map(
                     backend_page_size == PAGE_SIZE_4K {
                         let va_usize: usize = va.into();
                         let end_usize: usize = end.into();
-                        let huge_start = va_usize & !(PAGE_SIZE_2M - 1);
-                        let huge_end = huge_start + PAGE_SIZE_2M;
+                        let huge_start = va_usize & !(THP_PAGE_BYTES - 1);
+                        let huge_end = huge_start + THP_PAGE_BYTES;
 
                         if va_usize == huge_start && huge_end <= end_usize {
                             let base_va: VirtAddr = huge_start.into();
                             let (base_pa, _, _) = old_pt.query(base_va)?;
 
-                            for offset in (0..PAGE_SIZE_2M).step_by(PAGE_SIZE_4K) {
+                            for offset in (0..THP_PAGE_BYTES).step_by(PAGE_SIZE_4K) {
                                 inc_frame_ref(base_pa + offset);
                             }
 
                             old_pt.protect(base_va, cow_flags)?;
                             new_pt.map(base_va, base_pa, PageSize::Size2M, cow_flags)?;
-                            va = (base_va + PAGE_SIZE_2M).into();
+                            va = (base_va + THP_PAGE_BYTES).into();
                             continue;
                         }
                         old_pt.split_huge_pmd(va)?;

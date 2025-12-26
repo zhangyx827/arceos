@@ -1,22 +1,20 @@
 use alloc::{
-    boxed::Box,
-    sync::{Arc, Weak},
-    vec::Vec,
+    boxed::Box, sync::{Arc, Weak}, vec::Vec
 };
 #[cfg(feature = "times")]
 use core::sync::atomic::{AtomicU8, Ordering};
-use core::{ops::Range, task::Context};
+use core::{num::NonZeroUsize, ops::Range, task::Context};
 
 use axalloc::{UsageKind, global_allocator};
 use axfs_ng_vfs::{
     FileNode, Location, NodeFlags, NodePermission, NodeType, VfsError, VfsResult, path::Path,
 };
-use axhal::mem::{PhysAddr, VirtAddr, virt_to_phys, phys_to_virt};
+use axhal::mem::{PhysAddr, VirtAddr, phys_to_virt, virt_to_phys};
 use axio::{Buf, BufMut, SeekFrom};
 use axpoll::{IoEvents, Pollable};
 use intrusive_collections::{LinkedList, LinkedListAtomicLink, intrusive_adapter};
 use lru::LruCache;
-use spin::{Mutex, MutexGuard, RwLock};
+use spin::{Mutex, MutexGuard, Once, RwLock};
 
 use super::FsContext;
 
@@ -301,14 +299,22 @@ impl Default for OpenOptions {
 
 const PAGE_SIZE_4K: usize = 4096;
 const PAGE_SIZE_2M: usize = 2 * 1024 * 1024;
+const THP_NR_4K_PAGES: usize = PAGE_SIZE_2M / PAGE_SIZE_4K;
+
+#[derive(Debug, Clone, Copy)]
+pub enum PageOperation {
+    /// Unmap the page from page table
+    Unmap,
+    /// Demote huge page mapping from PMD to PTE
+    Demote,
+}
 
 #[derive(Debug)]
 pub struct PageCache {
     addr: VirtAddr,
     dirty: bool,
-    size: usize
+    size: usize,
 }
-
 impl PageCache {
     fn new(size: usize) -> VfsResult<Self> {
         let addr = global_allocator()
@@ -323,12 +329,33 @@ impl PageCache {
         })
     }
 
+    /// # Safety
+    /// - `addr` must be aligned to `PAGE_SIZE_4K`, and `size` must be a
+    ///   multiple of `PAGE_SIZE_4K`.
+    /// - The range `[addr, addr + size)` must refer to pages allocated from
+    ///   `global_allocator().alloc_pages(...)`.
+    /// - This `PageCache` must be the unique owner responsible for
+    ///   deallocating that range in `Drop` with `num_pages = size /
+    ///   PAGE_SIZE_4K` (i.e. no other object will deallocate the same pages,
+    ///   such as the original huge-page owner).
+    unsafe fn from_addr_unchecked(addr: VirtAddr, size: usize) -> Self {
+        Self {
+            addr,
+            size,
+            dirty: false,
+        }
+    }
+
     pub fn paddr(&self) -> PhysAddr {
         virt_to_phys(self.addr)
     }
 
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
     }
 
     pub fn data(&mut self) -> &mut [u8] {
@@ -345,12 +372,16 @@ impl Drop for PageCache {
         if self.dirty {
             warn!("dirty page dropped without flushing");
         }
-        global_allocator().dealloc_pages(self.addr.as_usize(), self.size / PAGE_SIZE_4K, UsageKind::PageCache);
+        global_allocator().dealloc_pages(
+            self.addr.as_usize(),
+            self.size / PAGE_SIZE_4K,
+            UsageKind::PageCache,
+        );
     }
 }
 
 struct EvictListener {
-    listener: Box<dyn Fn(u32, &PageCache) + Send + Sync>,
+    listener: Box<dyn Fn(u32, &PageCache, PageOperation) + Send + Sync>,
     link: LinkedListAtomicLink,
 }
 
@@ -359,21 +390,24 @@ intrusive_adapter!(EvictListenerAdapter = Box<EvictListener>: EvictListener { li
 struct CachedFileShared {
     page_cache: Mutex<LruCache<u32, PageCache>>,
     evict_listeners: Mutex<LinkedList<EvictListenerAdapter>>,
+    in_memory: bool,
 }
 
 impl CachedFileShared {
-    pub fn new() -> Self {
+    pub fn new(in_memory: bool) -> Self {
         Self {
-            page_cache: Mutex::new(LruCache::unbounded()),
-            // page_cache: Mutex::new(LruCache::new(NonZeroUsize::new(64).unwrap())),
+            // page_cache: Mutex::new(LruCache::unbounded()),
+            page_cache: Mutex::new(LruCache::new(NonZeroUsize::new(256).unwrap())),
             evict_listeners: Mutex::new(LinkedList::default()),
+            in_memory,
         }
     }
 
-    pub fn new_unbounded() -> Self {
+    pub fn new_unbounded(in_memory: bool) -> Self {
         Self {
             page_cache: Mutex::new(LruCache::unbounded()),
             evict_listeners: Mutex::new(LinkedList::default()),
+            in_memory,
         }
     }
 }
@@ -421,14 +455,15 @@ impl CachedFile {
             shared
         } else {
             let (shared, user_data) = if in_memory {
-                let shared = Arc::new(CachedFileShared::new_unbounded());
+                let shared = Arc::new(CachedFileShared::new_unbounded(true));
                 (shared.clone(), FileUserData::Strong(shared))
             } else {
-                let shared = Arc::new(CachedFileShared::new());
+                let shared = Arc::new(CachedFileShared::new(false));
                 let user_data = FileUserData::Weak(Arc::downgrade(&shared));
                 (shared, user_data)
             };
             guard.insert(user_data);
+            register_page_cache(&shared);
             shared
         };
         drop(guard);
@@ -451,7 +486,7 @@ impl CachedFile {
 
     pub fn add_evict_listener<F>(&self, listener: F) -> usize
     where
-        F: Fn(u32, &PageCache) + Send + Sync + 'static,
+        F: Fn(u32, &PageCache, PageOperation) + Send + Sync + 'static,
     {
         let pointer = Box::new(EvictListener {
             listener: Box::new(listener),
@@ -470,14 +505,11 @@ impl CachedFile {
 
     fn evict_cache(&self, file: &FileNode, pn: u32, page: &mut PageCache) -> VfsResult<()> {
         for listener in self.shared.evict_listeners.lock().iter() {
-            (listener.listener)(pn, page);
+            (listener.listener)(pn, page, PageOperation::Unmap);
         }
         if page.dirty {
-            // Since the `page` in the cache we can directly 
-            // calculate the offset with `pn`
             let page_start = pn as u64 * PAGE_SIZE_4K as u64;
             let file_len = file.len()?;
-            // If the file was truncated/unlinked, there may be no data left to flush.
             if page_start < file_len {
                 let len = (file_len - page_start).min(page.size() as u64) as usize;
                 file.write_at(&page.data()[..len], page_start)?;
@@ -487,13 +519,14 @@ impl CachedFile {
         Ok(())
     }
 
-    pub fn locate_chunk(&self, start_pn: u32, pn: u32) -> (Option<u32>, usize) {
-        let mut page_num = start_pn;
+    pub fn locate_chunk(&self, pn: u32) -> (Option<u32>, usize) {
+        let mut page_num = 0;
         let mut diff = 1;
         while page_num <= pn {
             let (opt_num, page_size) = self.with_page(page_num, |opt_page| {
                 if let Some(ref page) = opt_page {
-                    if page.size() == PAGE_SIZE_2M && page_num + (PAGE_SIZE_2M / PAGE_SIZE_4K) as u32 > pn 
+                    if page.size() == PAGE_SIZE_2M
+                        && page_num + (PAGE_SIZE_2M / PAGE_SIZE_4K) as u32 > pn
                     {
                         return (Some(page_num), PAGE_SIZE_2M);
                     }
@@ -501,11 +534,9 @@ impl CachedFile {
                         return (Some(page_num), PAGE_SIZE_4K);
                     }
                 }
-                diff = opt_page
-                    .map(|p| p.size() / PAGE_SIZE_4K)
-                    .unwrap_or(1) as u32;
-                return (None, 0)
-            }); 
+                diff = opt_page.map(|p| p.size() / PAGE_SIZE_4K).unwrap_or(1) as u32;
+                return (None, 0);
+            });
             if opt_num.is_some() {
                 return (opt_num, page_size);
             } else {
@@ -588,11 +619,7 @@ impl CachedFile {
             if read_start < read_end {
                 let page_offset = (read_start - chunk_start) as usize;
                 let len = (read_end - read_start) as usize;
-                initial = page_each(
-                    initial,
-                    page,
-                    page_offset..page_offset + len,
-                )?;
+                initial = page_each(initial, page, page_offset..page_offset + len)?;
             }
 
             chunk_start = chunk_end;
@@ -716,16 +743,16 @@ impl CachedFile {
     }
 
     pub fn retract_page_tables(
-        &self, 
-        start_pn: u32, 
-        guard: &mut MutexGuard<'_, LruCache<u32, PageCache>>
+        &self,
+        start_pn: u32,
+        guard: &mut MutexGuard<'_, LruCache<u32, PageCache>>,
     ) {
         let listeners = self.shared.evict_listeners.lock();
         for listener in listeners.iter() {
-            for i in 0..512 {
+            for i in 0..THP_NR_4K_PAGES as u32 {
                 let pn = start_pn + i;
                 if let Some(page) = guard.get_mut(&pn) {
-                    (listener.listener)(pn, page);
+                    (listener.listener)(pn, page, PageOperation::Unmap);
                 }
             }
         }
@@ -737,7 +764,7 @@ impl CachedFile {
         let page = PageCache::new(PAGE_SIZE_2M)?;
         let new_pa = page.paddr();
 
-        for i in 0..512 {
+        for i in 0..THP_NR_4K_PAGES as u32 {
             let pn = start_pn + i;
             let dst_off = i as usize * PAGE_SIZE_4K;
             if let Some(page) = guard.get_mut(&pn) {
@@ -745,40 +772,79 @@ impl CachedFile {
                 let src = phys_to_virt(src_pa);
                 let dst = phys_to_virt(new_pa + dst_off);
                 unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        src.as_ptr(),
-                        dst.as_mut_ptr(),
-                        PAGE_SIZE_4K,
-                    );
+                    core::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr(), PAGE_SIZE_4K);
                 }
             } else {
-                // This is a hole 
+                // This is a hole
             }
         }
 
-        for i in 0..512 {
+        for i in 0..THP_NR_4K_PAGES as u32 {
             if let Some(mut page) = guard.pop(&(start_pn + i)) {
                 if !self.in_memory {
-                // Don't write back pages since they're discarded
+                    // Don't write back pages since they're discarded
                     page.dirty = false;
                 }
             }
         }
-
+        // Since some caches have been evicted
+        // we don't have to evict cache here
         guard.put(start_pn, page);
         Ok(new_pa)
     }
 
-    /// Find the cache page that covers `offset` (bytes), returning (page_index, page_start_offset).
-    fn locate_offset(&self, offset: u64) -> (u32, u64) {
+    pub fn split_huge_page(&self, pn: u32) -> VfsResult<usize> {
+        let (base_pn_opt, _) = self.locate_chunk(pn);
+        let base_pn = base_pn_opt.unwrap();
+        let mut guard = self.shared.page_cache.lock();
+        let page = guard.get(&base_pn).unwrap();
+        let start_va = phys_to_virt(page.paddr());
+        let file = self.inner.entry().as_file()?;
+        let huge_page = guard.pop(&base_pn).unwrap();
+
+        for listener in self.shared.evict_listeners.lock().iter() {
+            (listener.listener)(base_pn, &huge_page, PageOperation::Demote);
+        }
+        
+        core::mem::forget(huge_page);
+        
+        for i in 0..THP_NR_4K_PAGES as u32 {
+            if guard.len() == guard.cap().get() {
+                // Cache is full, remove the least recently used page
+                if let Some((pn, mut page)) = guard.pop_lru() {
+                    // NOTE: Currently we only collapse read-only mappings, so
+                    // pages are never marked dirty. Therefore `evict_cache()`
+                    // won't perform writeback and is not expected to return an
+                    // error here. 
+                    if let Err(err) = self.evict_cache(file, pn, &mut page) {
+                        guard.put(pn, page);
+                        return Err(err);
+                    }
+                }
+            }
+
+            // SAFETY: `addr` points to the i-th 4KiB subpage of the 2MiB page we
+            // just removed from the cache; we also `forget(huge_page)` above so
+            // the 2MiB owner will not deallocate these pages. Each subpage is
+            // wrapped exactly once and will be deallocated by `PageCache::Drop`
+            // with `num_pages = 1`.
+            let addr = start_va + i as usize * PAGE_SIZE_4K;
+            let new_page = unsafe { PageCache::from_addr_unchecked(addr, PAGE_SIZE_4K) };
+            guard.put(base_pn + i, new_page);
+        }
+        Ok(0)
+    }
+    
+
+    /// Find the cache page that covers `offset` (bytes), returning (page_index,
+    /// page_start_offset).
+    pub fn locate_offset(&self, offset: u64) -> (u32, u64) {
         let mut pn = 0;
         let mut chunk_start = 0;
         let mut size = 0;
         while chunk_start < offset {
             size = self.with_page(pn, |opt_page| {
-                opt_page
-                    .map(|p| p.size())
-                    .unwrap_or(PAGE_SIZE_4K)
+                opt_page.map(|p| p.size()).unwrap_or(PAGE_SIZE_4K)
             }) as u64;
 
             let chunk_end = chunk_start + size;
@@ -790,6 +856,93 @@ impl CachedFile {
         }
         (pn, chunk_start)
     }
+}
+
+static PAGE_CACHE_REGISTRY: Once<Mutex<Vec<Weak<CachedFileShared>>>> = Once::new();
+
+fn page_cache_registry() -> &'static Mutex<Vec<Weak<CachedFileShared>>> {
+    PAGE_CACHE_REGISTRY.call_once(|| Mutex::new(Vec::new()))
+}
+
+fn register_page_cache(shared: &Arc<CachedFileShared>) {
+    let mut caches = page_cache_registry().lock();
+    caches.push(Arc::downgrade(shared));
+}
+
+/// Best-effort global page cache reclaim.
+///
+/// This only evicts clean pages from non-tmpfs caches that currently have no
+/// registered eviction listeners (i.e. are not mmap'd anywhere), so it is safe
+/// to call even while holding an address space lock.
+///
+/// Returns the number of 4KiB pages freed.
+pub fn shrink_page_cache(target_pages: usize) -> usize {
+    if target_pages == 0 {
+        return 0;
+    }
+
+    let caches_snapshot = page_cache_registry().lock().clone();
+    let mut freed_pages = 0usize;
+
+    for weak in caches_snapshot {
+        if freed_pages >= target_pages {
+            break;
+        }
+        let Some(shared) = weak.upgrade() else { continue; };
+        if shared.in_memory {
+            continue;
+        }
+        if !shared.evict_listeners.lock().is_empty() {
+            continue;
+        }
+
+        let mut dirty_skips = 0usize;
+        loop {
+            if freed_pages >= target_pages {
+                break;
+            }
+
+            let popped = {
+                let mut guard = shared.page_cache.lock();
+                if guard.is_empty() {
+                    None
+                } else {
+                    match guard.pop_lru() {
+                        None => None,
+                        Some((pn, page)) if page.dirty => {
+                            guard.put(pn, page);
+                            dirty_skips += 1;
+                            if dirty_skips >= guard.len() {
+                                // No evictable pages in this cache.
+                                None
+                            } else {
+                                Some(None)
+                            }
+                        }
+                        Some((_pn, page)) => {
+                            dirty_skips = 0;
+                            Some(Some(page))
+                        }
+                    }
+                }
+            };
+
+            match popped {
+                None => break,
+                Some(None) => continue, // skipped a dirty page
+                Some(Some(page)) => {
+                    let pages = page.size() / PAGE_SIZE_4K;
+                    freed_pages += pages;
+                    // drop(page) here frees the underlying memory
+                }
+            }
+        }
+    }
+
+    // Best-effort cleanup of dead entries.
+    page_cache_registry().lock().retain(|w| w.upgrade().is_some());
+
+    freed_pages
 }
 
 impl Drop for CachedFile {

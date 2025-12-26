@@ -17,9 +17,18 @@ use axhal::{
 };
 use kspin::SpinNoIrq;
 use lazyinit::LazyInit;
-use memory_addr::{MemoryAddr, PhysAddr, va};
+use memory_addr::{MemoryAddr, PhysAddr, PAGE_SIZE_2M, PAGE_SIZE_4K, va};
 
 pub use self::aspace::{AddrSpace, ScanResult};
+
+/// The hugepage size used by THP (Transparent Huge Pages) in this project.
+///
+/// Today StarryOS only supports PMD-sized THP (typically 2 MiB on 4 KiB-base-page
+/// systems). Centralize the choice here to avoid scattering magic numbers.
+pub const THP_PAGE_BYTES: usize = PAGE_SIZE_2M;
+
+/// Number of 4 KiB base pages in one THP huge page.
+pub const THP_NR_4K_PAGES: usize = THP_PAGE_BYTES / PAGE_SIZE_4K;
 
 static KERNEL_ASPACE: LazyInit<SpinNoIrq<AddrSpace>> = LazyInit::new();
 

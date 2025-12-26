@@ -3,14 +3,14 @@ use alloc::{boxed::Box, sync::Arc, vec::Vec};
 
 use axalloc::{UsageKind, global_allocator};
 use axerrno::{AxError, AxResult};
-use axfs_ng::CachedFile;
+use axfs_ng::{CachedFile, PageOperation};
 use axhal::{
     mem::{phys_to_virt, virt_to_phys},
     paging::{MappingFlags, PageSize, PageTable, PageTableMut},
 };
 use axsync::Mutex;
 use enum_dispatch::enum_dispatch;
-use memory_addr::{DynPageIter, PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange};
+use memory_addr::{DynPageIter, MemoryAddr, PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange};
 use memory_set::MappingBackend;
 use bitflags::bitflags;
 
@@ -23,7 +23,7 @@ use page_table_multiarch::PagingError;
 pub use shared::{current_shmem_thp_policy, set_shmem_thp_policy};
 pub use cow::{current_thp_policy, frame_ref_count, set_thp_policy};
 
-use crate::AddrSpace;
+use crate::{AddrSpace, THP_PAGE_BYTES};
 
 fn divide_page(size: usize, page_size: PageSize) -> usize {
     assert!(page_size.is_aligned(size), "unaligned");
@@ -58,18 +58,18 @@ fn register_cache_listener<T>(
     cache: &CachedFile,
     backend: &Arc<T>,
     aspace: &Arc<Mutex<AddrSpace>>,
-    on_evict: impl Fn(&Arc<T>, u32, &mut AddrSpace) + Send + Sync + 'static,
+    on_evict: impl Fn(&Arc<T>, u32, &mut AddrSpace, PageOperation) + Send + Sync + 'static,
 ) -> usize 
 where 
     T: Send + Sync + 'static,
 {
     let backend_w = Arc::downgrade(backend);
     let aspace_w = Arc::downgrade(aspace);
-    cache.add_evict_listener(move |pn, _page| {
+    cache.add_evict_listener(move |pn, _page, op| {
         let Some(backend) = backend_w.upgrade() else { return; };
         let Some(aspace) = aspace_w.upgrade() else { return; };
         let Some(mut aspace) = aspace.try_lock() else { return; };
-        on_evict(&backend, pn, &mut aspace);
+        on_evict(&backend, pn, &mut aspace, op);
     })
 }
 
@@ -92,7 +92,8 @@ impl EvictMatch for shared::SharedBackendInner {
 fn on_evict<T>(
     backend: &Arc<T>, 
     vaddr: VirtAddr,
-    aspace: &mut AddrSpace
+    aspace: &mut AddrSpace,
+    op: PageOperation,
 )
 where
     T: EvictMatch,
@@ -104,12 +105,23 @@ where
         // Ignore if the page is not controlled by this file mapping.
         return;
     }
-
     let pt = aspace.page_table_mut();
-    match pt.modify().unmap(vaddr) {
-        Ok(_) | Err(PagingError::NotMapped) => {}
-        Err(err) => {
-            warn!("Failed to unmap page {:?}: {:?}", vaddr, err);
+    match op {
+        PageOperation::Unmap => {
+            match pt.modify().unmap(vaddr) {
+                Ok(_) | Err(PagingError::NotMapped) => {}
+                Err(err) => {
+                    warn!("Failed to unmap page {:?}: {:?}", vaddr, err);
+                }
+            }
+        }
+        PageOperation::Demote => {
+            match pt.modify().split_huge_pmd(vaddr) {
+                Ok(_) | Err(PagingError::NotMapped) => {}
+                Err(err) => {
+                    warn!("Failed to split page {:?}: {:?}", vaddr, err);
+                }
+            }
         }
     }
 }
@@ -203,6 +215,41 @@ pub trait BackendOps {
         fault_in: bool,
         callbacks: Option<&mut Vec<Box<dyn FnOnce(&mut AddrSpace)>>>,
     ) -> AxResult;
+
+    fn demote_huge(
+        &self,
+        range: VirtAddrRange,
+        pt: &mut PageTableMut,
+    ) -> AxResult {
+        // Hugetlb mappings must not be partially protected at 4KiB granularity.
+        // Allow mprotect only when the range is aligned to the backend page size.
+        if self.contain_vma_flag(VmaFlags::VM_HUGETLB) {
+            let ps = self.page_size();
+            if !range.start.is_aligned(ps) || !range.end.is_aligned(ps) {
+                return Err(AxError::InvalidInput);
+            }
+            return Ok(());
+        }
+
+        // If a 2MiB PMD mapping is only partially covered by the mprotect range,
+        // demote it to PTEs first. File/Shared backends may override this hook to
+        // additionally split their page cache representation.
+        let range_end = range.end;
+        let mut vaddr = range.start.align_down(PageSize::Size2M);
+        while vaddr < range_end {
+            let huge_start = vaddr;
+            let huge_end = huge_start + THP_PAGE_BYTES;
+            if range.start > huge_start || range_end < huge_end {
+                if let Ok((_, _, page_size)) = pt.query(huge_start) {
+                    if page_size == PageSize::Size2M {
+                        pt.split_huge_pmd(huge_start)?;
+                    }
+                }
+            }
+            vaddr += THP_PAGE_BYTES;
+        }
+        Ok(())
+    }
 }
 
 /// A unified enum type for different memory mapping backends.
@@ -219,6 +266,10 @@ impl MappingBackend for Backend {
     type Addr = VirtAddr;
     type Flags = MappingFlags;
     type PageTable = PageTable;
+
+    fn page_size(&self) -> usize {
+        BackendOps::page_size(self) as usize
+    }
 
     fn map(&self, start: VirtAddr, size: usize, flags: MappingFlags, pt: &mut PageTable) -> bool {
         let range = VirtAddrRange::from_start_size(start, size);

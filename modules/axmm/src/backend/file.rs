@@ -6,16 +6,19 @@ use alloc::{
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use axerrno::{AxError, AxResult};
-use axfs_ng::{CachedFile, FileFlags};
-use axhal::{
-    paging::{MappingFlags, PageSize, PageTableMut, PagingError},
-};
-use axsync::{Mutex, MutexGuard};
-use memory_addr::{MemoryAddr, PAGE_SIZE_2M, PAGE_SIZE_4K, VirtAddr, VirtAddrRange};
+use axfs_ng::{CachedFile, FileFlags, PageOperation};
+use axhal::paging::{MappingFlags, PageSize, PageTable, PageTableMut, PagingError};
+use axsync::Mutex;
+use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr, VirtAddrRange};
 
 use crate::{
-    AddrSpace, backend::{Backend, BackendOps, VmaFlags, current_shmem_thp_policy, pages_in, 
-        register_cache_listener, on_evict}
+    AddrSpace,
+    THP_NR_4K_PAGES,
+    THP_PAGE_BYTES,
+    backend::{
+        Backend, BackendOps, VmaFlags, current_shmem_thp_policy, current_thp_policy, pages_in,
+        register_cache_listener,
+    },
 };
 
 #[doc(hidden)]
@@ -43,50 +46,52 @@ impl Drop for FileBackendInner {
 
 impl FileBackendInner {
     pub fn register_listener(self: &Arc<Self>, aspace: &Arc<Mutex<AddrSpace>>) -> usize {
-        register_cache_listener(&self.cache, &self, aspace, |backend, pn, aspace| {
-            backend.on_evict(pn, aspace)
+        register_cache_listener(&self.cache, &self, aspace, |backend, pn, aspace, op| {
+            backend.on_evict(pn, aspace, op)
         })
     }
 
-    fn on_evict(
-        self: &Arc<Self>, 
-        pn: u32,
-        aspace: &mut AddrSpace
-    ) {
+    fn on_evict(self: &Arc<Self>, pn: u32, aspace: &mut AddrSpace, op: PageOperation) {
         let Some(pn) = pn.checked_sub(self.offset_page) else {
             return;
-        };  
+        };
         let vaddr = self.start + pn as usize * PageSize::Size4K as usize;
-        super::on_evict(self, vaddr, aspace);
+        super::on_evict(self, vaddr, aspace, op);
     }
 
     pub fn transparent_hugepage_enabled(&self) -> bool {
-        // Only support tmpfs 
-        if !self.cache.in_memory() {
+        let v = *self.vma_flags.lock();
+        if v.contains(VmaFlags::VM_NOHUGEPAGE) {
             return false;
         }
-        let v = *self.vma_flags.lock();
-        v.contains(VmaFlags::VM_HUGEPAGE)
-        || current_shmem_thp_policy().eq("always\n")
+
+        if self.cache.in_memory() {
+            match current_shmem_thp_policy().as_str() {
+                "always" => true,
+                "advise" => v.contains(VmaFlags::VM_HUGEPAGE),
+                "never" => false,
+                _ => false,
+            }
+        } else {
+            match current_thp_policy().as_str() {
+                "always" => true,
+                "madvise" => v.contains(VmaFlags::VM_HUGEPAGE),
+                "never" => false,
+                _ => false,
+            }
+        }
     }
 
     /// Sets per-VMA THP-related flags (e.g. VM_HUGEPAGE / VM_NOHUGEPAGE).
     pub fn set_vma_flag(&self, flag: VmaFlags) {
-        // Follow the same policy as shmem: only honor explicit per-VMA hints
-        // when the global shmem policy is "advise".
-        if current_shmem_thp_policy().eq("advise") {
-            let mut v = self.vma_flags.lock();
-            *v |= flag;
-        }   
+        let mut v = self.vma_flags.lock();
+        *v |= flag;
     }
 
     /// Clears per-VMA THP-related flags.
     pub fn clear_vma_flag(&self, flag: VmaFlags) {
-    // When shmem policy is "always", per-VMA "nohuge" overrides are relevant.
-        if current_shmem_thp_policy().eq("always") {
-            let mut v = self.vma_flags.lock();
-            *v ^= flag;
-        }
+        let mut v = self.vma_flags.lock();
+        v.remove(flag);
     }
 }
 
@@ -123,6 +128,210 @@ impl FileBackend {
 }
 
 impl BackendOps for FileBackend {
+    fn map(&self, _range: VirtAddrRange, flags: MappingFlags, _pt: &mut PageTableMut) -> AxResult {
+        self.check_flags(flags)
+    }
+
+    fn unmap(&self, range: VirtAddrRange, pt: &mut PageTableMut) -> AxResult {
+        if !range.start.is_aligned(PAGE_SIZE_4K) || !range.end.is_aligned(PAGE_SIZE_4K) {
+            return Err(AxError::InvalidInput);
+        }
+
+        let mut va = range.start;
+        let end = range.end;
+        while va < end {
+            match pt.query(va) {
+                Ok((paddr, _, page_size)) => {
+                    if page_size == PageSize::Size2M {
+                        let va_usize: usize = va.into();
+                        let end_usize: usize = end.into();
+                        let huge_start = va_usize & !(THP_PAGE_BYTES - 1);
+                        let huge_end = huge_start + THP_PAGE_BYTES;
+
+                        if va_usize == huge_start && huge_end <= end_usize {
+                            let base_va: VirtAddr = huge_start.into();
+                            let (base_pa, ..) = pt.query(base_va)?;
+                            pt.unmap(base_va)?;
+                            va = (base_va + THP_PAGE_BYTES).into();
+                            continue;
+                        }
+
+                        pt.split_huge_pmd(va)?;
+                        let offset = va - self.0.start;
+                        let pn = offset / PAGE_SIZE_4K + self.0.offset_page as usize;
+                        self.0.cache.split_huge_page(pn as u32)?;
+                        continue;
+                    } else {
+                        pt.unmap(va)?;
+                        let step: usize = page_size.into();
+                        va += step;
+                    }
+                }
+                Err(PagingError::NotMapped) => {
+                    va += PAGE_SIZE_4K;
+                }
+                Err(err) => {
+                    warn!("Failed to unmap page {:?}: {:?}", va, err);
+                    return Err(err.into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn on_protect(
+        &self,
+        _range: VirtAddrRange,
+        new_flags: MappingFlags,
+        _pt: &mut PageTableMut,
+    ) -> AxResult {
+        self.check_flags(new_flags)
+    }
+
+    fn populate(
+        &self,
+        range: VirtAddrRange,
+        flags: MappingFlags,
+        access_flags: MappingFlags,
+        pt: &mut PageTableMut,
+    ) -> AxResult<(usize, Option<Box<dyn FnOnce(&mut AddrSpace)>>)> {
+        if !range.start.is_aligned_4k() || !range.end.is_aligned_4k() {
+            return Err(AxError::InvalidInput);
+        }
+
+        let mut pages = 0;
+        let mut to_be_evicted = Vec::new();
+        let start_page = ((range.start - self.0.start) / PAGE_SIZE_4K) as u32 + self.0.offset_page;
+        let mut pn = start_page;
+        let mut va = range.start;
+        let end = range.end;
+        let file_len = self.0.cache.len()?;
+
+        let (opt_num, size) = self.0.cache.locate_chunk(start_page);
+        let mut page_size = PAGE_SIZE_4K;
+        let mut base_pn = pn;
+        if let Some(chunk_num) = opt_num {
+            base_pn = chunk_num;
+            page_size = size;
+        }
+
+        while va < end {
+            let offset = va - self.0.start;
+            if offset >= file_len as usize {
+                // access that lies beyond the
+                // end of the mapped file is not allowed
+                return Err(AxError::BadAddress);
+            }
+            match pt.query(va) {
+                Ok((paddr, page_flags, page_size)) => {
+                    if access_flags.contains(MappingFlags::WRITE)
+                        && !page_flags.contains(MappingFlags::WRITE)
+                    {
+                        let in_memory = self.0.cache.in_memory();
+                        // For non-memory files we only support read-only mappings, so this path
+                        // handles them as 4KiB pages (no writable THP for file-backed mappings).
+                        self.0.cache.with_page(pn, |page| {
+                            if !in_memory {
+                                page.expect("page should be present").mark_dirty();
+                            }
+                            pt.remap(va, paddr, flags)?;
+                            pages += 1;
+                            pn += 1;
+                            va += PAGE_SIZE_4K;
+                            AxResult::Ok(())
+                        })?;
+                    } else if page_flags.contains(access_flags) {
+                        let base_va = va.align_down(page_size);
+                        let off = va - base_va;
+                        va += page_size as usize - off;
+                        pn += (page_size as usize - off) as u32 / PAGE_SIZE_4K as u32;
+                    }
+                }
+                // If the page is not mapped, try map it.
+                Err(PagingError::NotMapped) => {
+                    let map_flags = if self.0.cache.in_memory() {
+                        // For in memory files, we don't need to (and also
+                        // musn't) mark them dirty, so we can use the original
+                        // flags.
+                        flags
+                    } else {
+                        flags - MappingFlags::WRITE
+                    };
+                    self.0
+                        .cache
+                        .with_page_or_insert(base_pn, PAGE_SIZE_4K, |page, evicted| {
+                            if let Some((pn, _)) = evicted {
+                                to_be_evicted.push(pn);
+                            }
+                            let page_size = page.size();
+                            let end_off =
+                                offset.checked_add(page_size).ok_or(AxError::BadAddress)?;
+                            if va.is_aligned(page_size)
+                                && range.contains(va)
+                                && (range.end - va) >= page_size
+                                && end_off <= file_len as usize
+                            {
+                                let size = if page_size == PAGE_SIZE_4K {
+                                    PageSize::Size4K
+                                } else {
+                                    PageSize::Size2M
+                                };
+                                pt.map(va, page.paddr(), size, map_flags)?;
+                                pages += 1;
+                                va += page_size;
+                                pn += page_size as u32 / PAGE_SIZE_4K as u32;
+                                base_pn += page_size as u32 / PAGE_SIZE_4K as u32;
+                                return Ok(());
+                            }
+                            // Fall back to 4KiB
+                            // `base_pn` is not changed here
+                            let pa = page.paddr() + (pn - base_pn) as usize * PAGE_SIZE_4K;
+                            pt.map(va, pa, PageSize::Size4K, map_flags)?;
+                            pages += 1;
+                            va += PAGE_SIZE_4K;
+                            pn += 1;
+                            Ok(())
+                        })?;
+                }
+                Err(_) => return Err(AxError::BadAddress),
+            }
+        }
+        Ok((
+            pages,
+            if to_be_evicted.is_empty() {
+                None
+            } else {
+                let inner = self.0.clone();
+                Some(Box::new(move |aspace: &mut AddrSpace| {
+                    for pn in to_be_evicted {
+                        inner.on_evict(pn, aspace, PageOperation::Unmap);
+                    }
+                }))
+            },
+        ))
+    }
+
+    fn clone_map(
+        &self,
+        _range: VirtAddrRange,
+        _flags: MappingFlags,
+        _old_pt: &mut PageTableMut,
+        _new_pt: &mut PageTableMut,
+        new_aspace: &Arc<Mutex<AddrSpace>>,
+    ) -> AxResult<Backend> {
+        let inner = Arc::new(FileBackendInner {
+            start: self.0.start,
+            cache: self.0.cache.clone(),
+            flags: self.0.flags,
+            offset_page: self.0.offset_page,
+            handle: AtomicUsize::new(0),
+            futex_handle: self.0.futex_handle.clone(),
+            vma_flags: VmaFlags::empty().into(),
+        });
+        inner.register_listener(new_aspace);
+        Ok(Backend::File(FileBackend(inner)))
+    }
+
     fn collapse_page(
         &self,
         // 2MiB range
@@ -131,25 +340,44 @@ impl BackendOps for FileBackend {
         fault_in: bool,
         mut callbacks: Option<&mut Vec<Box<dyn FnOnce(&mut AddrSpace)>>>,
     ) -> AxResult {
+        let file_len = self.0.cache.len()?;
+        let end_off = range.end - self.0.start;
+        if end_off > file_len as usize && !self.is_in_memory() {
+            return Err(AxError::InvalidInput);
+        }
         let start_pn = ((range.start - self.0.start) / PAGE_SIZE_4K) as u32 + self.0.offset_page;
         let end_pn = start_pn + (range.size() / PAGE_SIZE_4K) as u32;
+
         let mut has_partial_huge = false;
         let mut start_chunk = 0;
         let mut pn = start_pn;
+        let in_memory = self.0.cache.in_memory();
+        let (chunk_pn_opt, chunk_size) = self.0.cache.locate_chunk(pn);
+        if let Some(start_pn) = chunk_pn_opt {
+            pn = start_pn;
+        }
 
         while pn < end_pn {
-            let (chunk_pn_opt, chunk_size) = self.0.cache.locate_chunk(start_chunk, pn);
-            if let Some(chunk_pn) = chunk_pn_opt {
-                if chunk_size == PAGE_SIZE_2M {
-                    if chunk_pn > start_pn || chunk_pn + 512 < end_pn {
-                        return Ok(())
+            let give_up = self.0.cache.with_page(pn, |page| {
+                if let Some(page) = page {
+                    if page.size() == THP_PAGE_BYTES {
+                        if pn > start_pn || pn + (THP_NR_4K_PAGES as u32) < end_pn {
+                            return true;
+                        }
+                    }
+                    if !in_memory && page.is_dirty() {
+                        // non in-memory files should be clean
+                        return true;
                     }
                 }
+                false
+            });
+            if give_up {
+                return Err(AxError::InvalidInput);
             }
             pn += 1;
-            start_chunk = pn;
         }
-        
+
         let mut flags_opt: Option<MappingFlags> = None;
         let mut fault_addrs = Vec::new();
         for (_, addr) in pages_in(range, PageSize::Size4K)?.enumerate() {
@@ -158,7 +386,7 @@ impl BackendOps for FileBackend {
                     if flags_opt.is_none() {
                         flags_opt = Some(page_flags);
                     }
-                },
+                }
                 Err(PagingError::NotMapped) => {
                     if fault_in {
                         fault_addrs.push(addr);
@@ -166,7 +394,7 @@ impl BackendOps for FileBackend {
                 }
                 _ => {
                     return Err(AxError::BadAddress);
-                },
+                }
             }
         }
 
@@ -177,7 +405,7 @@ impl BackendOps for FileBackend {
 
         let reused_huge = self.0.cache.with_page(start_pn, |page| {
             if let Some(page) = page {
-                page.size() == PAGE_SIZE_2M
+                page.size() == THP_PAGE_BYTES
                     && pt
                         .remap_huge(range.start, page.paddr(), flags, PageSize::Size2M)
                         .is_ok()
@@ -231,8 +459,7 @@ impl BackendOps for FileBackend {
             *pages_scanned += 1;
 
             match pt.query(addr) {
-                Ok((_, _, _)) => {
-                }
+                Ok((..)) => {}
                 Err(PagingError::NotMapped) => {
                     pte_none += 1;
                     if pte_none > max_ptes_none {
@@ -245,6 +472,38 @@ impl BackendOps for FileBackend {
 
         self.collapse_page(range, pt, false, None)?;
         Ok(true)
+    }
+
+    fn demote_huge(
+        &self,
+        range: VirtAddrRange,
+        pt: &mut PageTableMut,
+    ) -> AxResult {
+        // If a 2MiB PMD mapping is only partially covered by this range, demote it
+        // to 4KiB PTEs and also split the underlying page cache huge chunk so that
+        // future 4KiB operations (unmap, eviction, etc.) remain consistent.
+        let range_end = range.end;
+        let mut vaddr = range.start.align_down(PageSize::Size2M);
+        while vaddr < range_end {
+            let huge_start = vaddr;
+            let huge_end = huge_start + THP_PAGE_BYTES;
+            if range.start > huge_start || range_end < huge_end {
+                if let Ok((_, _, page_size)) = pt.query(huge_start) {
+                    if page_size == PageSize::Size2M {
+                        pt.split_huge_pmd(huge_start)?;
+
+                        let offset = huge_start - self.0.start;
+                        let pn = offset / PAGE_SIZE_4K + self.0.offset_page as usize;
+                        let (base_opt, chunk_size) = self.0.cache.locate_chunk(pn as u32);
+                        if base_opt.is_some() && chunk_size == THP_PAGE_BYTES {
+                            self.0.cache.split_huge_page(pn as u32)?;
+                        }
+                    }
+                }
+            }
+            vaddr += THP_PAGE_BYTES;
+        }
+        Ok(())
     }
 
     fn transparent_hugepage_enabled(&self) -> bool {
@@ -267,210 +526,8 @@ impl BackendOps for FileBackend {
         inner.vma_flags.lock().contains(flag)
     }
 
-
     fn page_size(&self) -> PageSize {
         PageSize::Size4K
-    }
-
-    fn map(&self, _range: VirtAddrRange, flags: MappingFlags, _pt: &mut PageTableMut) -> AxResult {
-        self.check_flags(flags)
-    }
-
-    fn unmap(&self, range: VirtAddrRange, pt: &mut PageTableMut) -> AxResult {
-            if !range.start.is_aligned(PAGE_SIZE_4K)
-            || !range.end.is_aligned(PAGE_SIZE_4K)
-        {
-            return Err(AxError::InvalidInput);
-        }
-
-        let mut va = range.start;
-        let end = range.end;
-        while va < end {
-            match pt.query(va) {
-                Ok((paddr, _, page_size)) => {
-                    if page_size == PageSize::Size2M {
-                        let va_usize: usize = va.into();
-                        let end_usize: usize = end.into();
-                        let huge_start = va_usize & !(PAGE_SIZE_2M - 1);
-                        let huge_end = huge_start + PAGE_SIZE_2M;
-
-                        if va_usize == huge_start && huge_end <= end_usize {
-                            let base_va: VirtAddr = huge_start.into();
-                            let (base_pa, _, _) = pt.query(base_va)?;
-                            pt.unmap(base_va)?;
-                            va = (base_va + PAGE_SIZE_2M).into();
-                            continue;
-                        }
-
-                        pt.split_huge_pmd(va)?;
-                        continue;
-                    } else {
-                        pt.unmap(va)?;
-                        let step: usize = page_size.into();
-                        va += step;
-                    }
-                }
-                Err(PagingError::NotMapped) => {
-                    va += PAGE_SIZE_4K;
-                }
-                Err(err) => {
-                    warn!("Failed to unmap page {:?}: {:?}", va, err);
-                    return Err(err.into());
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn on_protect(
-        &self,
-        _range: VirtAddrRange,
-        new_flags: MappingFlags,
-        _pt: &mut PageTableMut,
-    ) -> AxResult {
-        self.check_flags(new_flags)
-    }
-
-    
-    fn populate(
-        &self,
-        range: VirtAddrRange,
-        flags: MappingFlags,
-        access_flags: MappingFlags,
-        pt: &mut PageTableMut,
-    ) -> AxResult<(usize, Option<Box<dyn FnOnce(&mut AddrSpace)>>)> {
-        if !range.start.is_aligned_4k()
-            || !range.end.is_aligned_4k() 
-        {
-            return Err(AxError::InvalidInput);
-        }
-
-        let offset = range.start - self.0.start;
-        // access that lies beyond the
-        // end of the mapped file is not allowed
-        let file_len = self.0.cache.len()?;
-        if offset >= file_len as usize {
-            return Err(AxError::BadAddress);
-        }
-        let mut pages = 0;
-        let mut to_be_evicted = Vec::new();
-        let start_page = (offset / PAGE_SIZE_4K) as u32 + self.0.offset_page;
-        let mut start_chunk = 0;
-        let mut pn = start_page;
-        let mut va = range.start;
-        let end = range.end;
-        while va < end {        
-                match pt.query(va) {
-                    Ok((paddr, page_flags, page_size)) => {
-                        if access_flags.contains(MappingFlags::WRITE)
-                            && !page_flags.contains(MappingFlags::WRITE)
-                        {
-                            let in_memory = self.0.cache.in_memory();
-                            // For non-memory files we only support read-only mappings, so this path
-                            // handles them as 4KiB pages (no writable THP for file-backed mappings).
-                            self.0.cache.with_page(pn, |page| {
-                                if !in_memory {
-                                    page.expect("page should be present").mark_dirty();
-                                }
-                                pt.remap(va, paddr, flags)?;
-                                pages += 1;
-                                pn += 1;
-                                va += PAGE_SIZE_4K;
-                                AxResult::Ok(())
-                            })?;
-                        } else if page_flags.contains(access_flags) {
-                            let base_va = va.align_down(page_size);
-                            let off = va - base_va;
-                            va += page_size as usize - off;
-                            pn += (page_size as usize - off) as u32 / PAGE_SIZE_4K as u32;
-                        }
-                    }
-                    // If the page is not mapped, try map it.
-                    Err(PagingError::NotMapped) => {
-                        let map_flags = if self.0.cache.in_memory() {
-                            // For in memory files, we don't need to (and also
-                            // musn't) mark them dirty, so we can use the original
-                            // flags.
-                            flags
-                        } else {
-                            flags - MappingFlags::WRITE
-                        };
-                        let (opt_num, size) = self.0.cache.locate_chunk(start_chunk, pn);
-                        let mut base_va = va;
-                        let mut page_size = PAGE_SIZE_4K;
-                        let mut base_pn = pn;
-                        if let Some(chunk_num) = opt_num {
-                            base_pn = chunk_num;
-                            start_chunk = chunk_num;
-                            page_size = size;
-                        }
-                        self.0.cache.with_page_or_insert(base_pn, page_size, |page, evicted| {
-                            if let Some((pn, _)) = evicted {
-                                to_be_evicted.push(pn);
-                            }
-                            if va.is_aligned(page_size) 
-                            && range.contains(va) 
-                            && (range.end - va) >= page_size 
-                            {
-                                let size = if page_size == PAGE_SIZE_4K {
-                                    PageSize::Size4K
-                                } else {
-                                    PageSize::Size2M
-                                };
-                                pt.map(va, page.paddr(), size, map_flags)?;
-                                pages += 1;
-                                va += page_size;
-                                pn += page_size as u32 / PAGE_SIZE_4K as u32;
-                                start_chunk = pn;
-                                return Ok(())
-                            }
-
-                            let pa = page.paddr() + (pn - base_pn) as usize * PAGE_SIZE_4K;
-                            pt.map(va, pa, PageSize::Size4K, map_flags)?;
-                            pages += 1;
-                            va += PAGE_SIZE_4K;
-                            pn += 1;
-                            // The `start_chunk` remains unchanged.
-                            Ok(())
-                        })?;
-                    }
-                    Err(_) => return Err(AxError::BadAddress),
-            }
-        }
-        Ok((
-            pages,
-            if to_be_evicted.is_empty() {
-                None
-            } else {
-                let inner = self.0.clone();
-                Some(Box::new(move |aspace: &mut AddrSpace| {
-                    for pn in to_be_evicted {
-                        inner.on_evict(pn, aspace);
-                    }
-                }))
-            },
-        ))
-    }
-
-    fn clone_map(
-        &self,
-        _range: VirtAddrRange,
-        _flags: MappingFlags,
-        _old_pt: &mut PageTableMut,
-        _new_pt: &mut PageTableMut,
-        new_aspace: &Arc<Mutex<AddrSpace>>,
-    ) -> AxResult<Backend> {
-        let inner = Arc::new(FileBackendInner {
-            start: self.0.start,
-            cache: self.0.cache.clone(),
-            flags: self.0.flags,
-            offset_page: self.0.offset_page,
-            handle: AtomicUsize::new(0),
-            futex_handle: self.0.futex_handle.clone(),
-            vma_flags: VmaFlags::empty().into(),
-        });
-        inner.register_listener(new_aspace);
-        Ok(Backend::File(FileBackend(inner)))
     }
 }
 
@@ -482,8 +539,7 @@ impl Backend {
         offset: usize,
         aspace: &Arc<Mutex<AddrSpace>>,
     ) -> Self {
-        // TODO !!!! not offset / PAGE_SIZE_4K
-        let offset_page = (offset / PAGE_SIZE_4K) as u32;
+        let (offset_page, _) = CachedFile::locate_offset(&cache, offset as u64);
         let inner = Arc::new(FileBackendInner {
             start,
             cache,

@@ -1,6 +1,9 @@
 use alloc::{sync::Arc, vec::Vec};
-use page_table_multiarch::PageSize;
-use core::{fmt, ops::DerefMut};
+use core::{
+    fmt,
+    ops::DerefMut,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 use axerrno::{AxError, AxResult, ax_bail};
 use axhal::{
@@ -10,24 +13,30 @@ use axhal::{
 };
 use axsync::Mutex;
 use memory_addr::{
-    MemoryAddr, PAGE_SIZE_4K, PAGE_SIZE_2M, PageIter4K, PhysAddr, VirtAddr, VirtAddrRange, is_aligned_4k,
+    MemoryAddr, PAGE_SIZE_4K, PageIter4K, PhysAddr, VirtAddr, VirtAddrRange,
+    is_aligned_4k,
 };
 use memory_set::{MappingError, MemoryArea, MemorySet};
-use crate::backend::{Backend, BackendOps, VmaFlags};
+use page_table_multiarch::PageSize;
 
+use crate::{THP_PAGE_BYTES, backend::{Backend, BackendOps, VmaFlags}};
 
 /// The virtual memory address space.
 pub struct AddrSpace {
     va_range: VirtAddrRange,
     areas: MemorySet<Backend>,
     pt: PageTable,
-    pub scan_cursor: Option<VirtAddr>,
+    scan_cursor: Option<VirtAddr>,
+    /// Per-process THP disable mode (PR_SET_THP_DISABLE semantics).
+    thp_mode: AtomicU32,
 }
 
 pub enum ScanResult {
     ScanContinue,
     ScanFinished,
-    ScanMmExit,
+    /// The scanner attempted to collapse a window but failed due to memory
+    /// allocation failure (e.g. huge page allocation).
+    ScanAllocFailed,
 }
 
 fn map_mapping_err(err: MappingError) -> AxError {
@@ -69,6 +78,16 @@ impl AddrSpace {
         self.pt.root_paddr()
     }
 
+    /// Returns the per-process THP disable mode.
+    pub fn thp_mode(&self) -> u32 {
+        self.thp_mode.load(Ordering::Relaxed)
+    }
+
+    /// Updates the per-process THP disable mode.
+    pub fn set_thp_mode(&self, mode: u32) {
+        self.thp_mode.store(mode, Ordering::Relaxed);
+    }
+
     /// Checks if the address space contains the given address range.
     pub fn contains_range(&self, start: VirtAddr, size: usize) -> bool {
         self.va_range.contains(start) && (self.va_range.end - start) >= size
@@ -81,6 +100,7 @@ impl AddrSpace {
             areas: MemorySet::new(),
             pt: PageTable::try_new().map_err(|_| AxError::NoMemory)?,
             scan_cursor: None,
+            thp_mode: AtomicU32::new(0),
         })
     }
 
@@ -287,6 +307,22 @@ impl AddrSpace {
     /// aligned.
     pub fn protect(&mut self, start: VirtAddr, size: usize, flags: MappingFlags) -> AxResult {
         self.validate_region(start, size)?;
+        let end = start + size;
+        let mut area_start = start;
+        // If a range only partially covers a PMD-mapped huge page, we need to demote
+        // it to 4KiB PTEs first. For file/shmem mappings this also needs to split
+        // their page cache huge chunk so that future 4KiB operations stay consistent.
+        while let Some(area) = self.areas.find(area_start) {
+            let range = VirtAddrRange::new(area_start, area.end().min(end));
+            let mut modify = self.pt.modify();
+            area.backend()
+                .demote_huge(range, &mut modify)?;
+            area_start = area.end();
+            assert!(start.is_aligned_4k());
+            if area_start >= end {
+                break;
+            }
+        }
 
         self.areas
             .protect(start, size, |_| Some(flags), &mut self.pt)
@@ -294,7 +330,7 @@ impl AddrSpace {
 
         Ok(())
     }
-    
+
     /// Split the area within the specified virtual address range.
     ///
     /// Returns an error if the address range is out of the address space or not
@@ -304,7 +340,9 @@ impl AddrSpace {
             return Ok(());
         }
         self.validate_region(start, size)?;
-        self.areas.split_range(start, size).map_err(map_mapping_err)?;
+        self.areas
+            .split_range(start, size)
+            .map_err(map_mapping_err)?;
         Ok(())
     }
 
@@ -389,7 +427,7 @@ impl AddrSpace {
         }
         false
     }
-    
+
     /// Attempts to clone the current address space into a new one.
     ///
     /// This method creates a new empty address space with the same base and
@@ -400,8 +438,11 @@ impl AddrSpace {
         let new_aspace_clone = new_aspace.clone();
 
         let mut guard = new_aspace.lock();
+        guard
+            .thp_mode
+            .store(self.thp_mode.load(Ordering::Relaxed), Ordering::Relaxed);
 
-	        let mut self_modify = self.pt.modify();
+        let mut self_modify = self.pt.modify();
         for area in self.areas.iter() {
             let new_backend = area.backend().clone_map(
                 area.va_range(),
@@ -411,8 +452,7 @@ impl AddrSpace {
                 &new_aspace_clone,
             )?;
 
-            let new_area =
-                MemoryArea::new(area.start(), area.size(), area.flags(), new_backend);
+            let new_area = MemoryArea::new(area.start(), area.size(), area.flags(), new_backend);
             let aspace = guard.deref_mut();
             aspace
                 .areas
@@ -427,14 +467,15 @@ impl AddrSpace {
     /// Finds the next area starting from the scan cursor.
     pub fn next_area(&self) -> Option<&MemoryArea<Backend>> {
         let cursor = self.scan_cursor.unwrap_or(self.base());
-        self.areas.iter()
-            .skip_while(|area| area.start() < cursor)
+        self.areas
+            .iter()
+            .skip_while(|area| area.end() <= cursor)
             .next()
     }
 
     /// Advances the scan cursor to `area_end` for resumption.
-    pub fn advance_scan_cursor(&mut self, area_end: VirtAddr) {
-        self.scan_cursor = Some(area_end);
+    pub fn advance_scan_cursor(&mut self, cursor: VirtAddr) {
+        self.scan_cursor = Some(cursor);
     }
 
     /// Resets scan to start from the beginning.
@@ -451,59 +492,96 @@ impl AddrSpace {
         pages_collapsed: &mut usize,
     ) -> ScanResult {
         let (backend, mut vaddr, area_end) = match self.next_area() {
-            None => return ScanResult::ScanFinished,
+            None => {
+                self.reset_scan_cursor();
+                return ScanResult::ScanFinished;
+            }
             Some(area) => {
-                if !area.backend().transparent_hugepage_enabled() 
-                || area.backend().contain_vma_flag(VmaFlags::VM_STACK) {
+                let thp_mode = self.thp_mode();
+                if thp_mode == 0x1 {
                     self.advance_scan_cursor(area.end());
                     return ScanResult::ScanContinue;
                 }
+                if thp_mode == 3 && !area.backend().contain_vma_flag(VmaFlags::VM_HUGEPAGE) {
+                    self.advance_scan_cursor(area.end());
+                    return ScanResult::ScanContinue;
+                }
+                if !area.backend().transparent_hugepage_enabled()
+                    || area.backend().contain_vma_flag(VmaFlags::VM_NOHUGEPAGE)
+                    || area.backend().contain_vma_flag(VmaFlags::VM_STACK)
+                {
+                    self.advance_scan_cursor(area.end());
+                    return ScanResult::ScanContinue;
+                }
+                let cursor = self.scan_cursor.unwrap_or(self.base());
+                let start = core::cmp::max(cursor, area.start());
                 (
                     area.backend().clone(),
-                    area.start().align_up(PAGE_SIZE_2M),
+                    start.align_up(THP_PAGE_BYTES),
                     area.end(),
                 )
             }
         };
 
-        while *pages_scanned < pages_to_scan && vaddr + PAGE_SIZE_2M <= area_end {
-            let range = VirtAddrRange::new(vaddr, vaddr + PAGE_SIZE_2M);
-            let before = *pages_scanned;
+        while *pages_scanned < pages_to_scan {
+            if vaddr + THP_PAGE_BYTES > area_end {
+                vaddr = area_end;
+                break;
+            }
+            // If this window is already mapped as a huge page, just account and skip.
+            if let Ok((_, _, page_size)) = self.pt.query(vaddr) {
+                if page_size == PageSize::Size2M {
+                    *pages_scanned += THP_PAGE_BYTES / PAGE_SIZE_4K;
+                    continue;
+                }
+            }
 
-            let collapsed = backend
-                .try_collapse_page(
+            let range = VirtAddrRange::new(vaddr, vaddr + THP_PAGE_BYTES);
+            let before = *pages_scanned;
+            let collapse_res = {
+                let mut pt = self.pt.modify();
+                backend.try_collapse_page(
                     range,
-                    &mut self.pt.modify(),
+                    &mut pt,
                     max_pte_none,
                     max_pte_shared,
                     pages_scanned,
                     pages_to_scan,
                 )
-                .unwrap_or(false);
-
-            if collapsed {
-                *pages_collapsed += PAGE_SIZE_2M / PAGE_SIZE_4K;
+            };
+            match collapse_res {
+                Ok(true) => {
+                    *pages_collapsed += THP_PAGE_BYTES / PAGE_SIZE_4K;
+                }
+                Ok(false) => {}
+                Err(AxError::NoMemory) => {
+                    // Save progress and let the caller throttle.
+                    self.advance_scan_cursor(vaddr);
+                    return ScanResult::ScanAllocFailed;
+                }
+                Err(_) => {}
             }
 
             let scanned_in_window = *pages_scanned - before;
-            if scanned_in_window < PAGE_SIZE_2M / PAGE_SIZE_4K && *pages_scanned >= pages_to_scan {
+            if scanned_in_window < THP_PAGE_BYTES / PAGE_SIZE_4K && *pages_scanned >= pages_to_scan
+            {
                 // Budget exhausted in the middle of this 2 MiB window.
                 // Do not advance vaddr so that we can resume from here next time.
                 break;
             }
 
-            vaddr += PAGE_SIZE_2M;
+            vaddr += THP_PAGE_BYTES;
         }
 
-        self.advance_scan_cursor(area_end);
+        self.advance_scan_cursor(vaddr);
         ScanResult::ScanContinue
     }
 
-    pub fn collapse_page_range(
-        &mut self,
-        start: VirtAddr,
-        len: usize,
-    ) -> AxResult<isize> {
+    pub fn collapse_page_range(&mut self, start: VirtAddr, len: usize) -> AxResult<isize> {
+        let thp_mode = self.thp_mode();
+        if thp_mode == 0x1 {
+            return Err(AxError::InvalidInput);
+        }
         let end = start + len;
         let mut vaddr = start;
         let mut last_err = None;
@@ -511,12 +589,12 @@ impl AddrSpace {
         while let Some(area) = self.areas.find(vaddr) {
             if area.backend().contain_vma_flag(
                 VmaFlags::VM_HUGETLB
-                | VmaFlags::VM_IO
-                | VmaFlags::VM_DONTEXPAND
-                | VmaFlags::VM_MIXEDMAP
-                | VmaFlags::VM_PFNMAP
-                | VmaFlags::VM_NOHUGEPAGE
-                | VmaFlags::VM_STACK
+                    | VmaFlags::VM_IO
+                    | VmaFlags::VM_DONTEXPAND
+                    | VmaFlags::VM_MIXEDMAP
+                    | VmaFlags::VM_PFNMAP
+                    | VmaFlags::VM_NOHUGEPAGE
+                    | VmaFlags::VM_STACK,
             ) {
                 return Err(AxError::InvalidInput);
             }
@@ -525,40 +603,42 @@ impl AddrSpace {
             vaddr = vaddr.align_up(PageSize::Size2M);
 
             let backend = area.backend().clone();
-            while vaddr + PAGE_SIZE_2M <= area_end {
+            while vaddr + THP_PAGE_BYTES <= area_end {
                 // Already PMD‑mapped THP
                 if let Ok((_, _, page_size)) = self.pt.query(vaddr) {
                     if page_size == PageSize::Size2M {
-                        vaddr += PAGE_SIZE_2M;
+                        vaddr += THP_PAGE_BYTES;
                         continue;
                     }
                 }
                 // File-backed (non in-memory) mappings only support THP on read-only VMAs.
                 if let Backend::File(file_backend) = &backend {
                     if !file_backend.is_in_memory() {
-                        if let Ok((_, pte_flags, _)) = self.pt.query(vaddr) {
-                            if pte_flags.contains(MappingFlags::WRITE) {
-                                last_err = Some(AxError::InvalidInput);
-                                vaddr += PAGE_SIZE_2M;
-                                continue;
-                            }
-                        }
+                        last_err = Some(AxError::InvalidInput);
+                        vaddr += THP_PAGE_BYTES;
+                        continue;
                     }
                 }
 
-                let range = VirtAddrRange::new(vaddr, vaddr + PAGE_SIZE_2M);
+                let range = VirtAddrRange::new(vaddr, vaddr + THP_PAGE_BYTES);
                 let mut callbacks = Vec::new();
-                match backend.collapse_page(range, &mut self.pt.modify(), true, Some(&mut callbacks))
-                {
-                    Ok(_) => {},
-                    Err(e) => { last_err = Some(e); }
+                match backend.collapse_page(
+                    range,
+                    &mut self.pt.modify(),
+                    true,
+                    Some(&mut callbacks),
+                ) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        last_err = Some(e);
+                    }
                 }
 
                 for cb in callbacks {
                     cb(self);
                 }
-                
-                vaddr += PAGE_SIZE_2M;
+
+                vaddr += THP_PAGE_BYTES;
             }
             vaddr = area_end;
             if vaddr >= end {
